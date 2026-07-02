@@ -85,8 +85,17 @@ about-string (fixed in launch cleanup).
 - [ ] **T14. Repo hygiene:** commit Cargo.lock (binary → reproducible builds); consider `maple gc`.
 
 ## Wave 5 — Environment / user-side (not maple code)
-- [ ] **E1. Upgrade ollama** (0.31.1 returns `tool_calls: null` — blocks goose/bob tool-calling on the Mac).
-- [ ] **E2. Re-run bob e2e** with qwen-coder after E1 (or on DGX vLLM w/ tool parser) → expect convergence.
+- [~] **E1.** ollama server still 0.31.1/`tool_calls: null` (restart pending) — MOOT: local MLX (:8080,
+  Qwen3-Coder-Next-4bit) AND DGX vLLM (192.168.1.193:8000, Intel/Qwen3-Coder-Next-int4-AutoRound)
+  both return proper structured tool_calls.
+- [x] **E2. Bob e2e CONVERGED 2026-07-02:** `bob: CONVERGED in 1 iteration(s)` — maple bundle in task →
+  goose → DGX vLLM → exact 1-line fix in worktree → pytest VERIFY pass → advisory judge absent
+  (correctly non-blocking per bob's policy code) → propose-mode candidate. **Config recipe discovered:**
+  (1) export `OPENAI_HOST=<endpoint>` — goose reads OPENAI_HOST; bob only sets OPENAI_BASE_URL
+  (bob one-line fix: set both in GooseBuilder); (2) use bob's roster **Full form**
+  (`models: {alias: {model, base_url}}`, tier references the alias) — bare tier strings get
+  provider/model-parsed and the id mangled. Every prior `EmptyDiffAfterCritique` traced to these two
+  + old-ollama tool parsing — never bob's design, never the models.
 - [ ] **E3. SC-4 at scale on DGX:** larger trial set, real task mix, set the formal SC-4 target
   (baseline: bundle 3/3 with qwen2.5-coder vs 2/3 gemma; whole-file 0/2 gemma).
 
@@ -94,3 +103,10 @@ about-string (fixed in launch cleanup).
 Languages beyond Python (universal tier already works; exact resolvers ASK-FIRST K3) · caller
 pagination/cursoring (enumerate suffices for Hector) · `--watch` daemon (K1) · lazy LLM summaries (K4)
 · depth-N closure (L5) · overflow ranking (L6).
+
+## Wave L1 — Multi-language universal tier ✅ DONE 2026-07-02 (spec: waves/WAVE-L1-SPEC.md; verified)
+9 languages (py + rs/c/cpp/cs/java/js/ts/go; TS+TSX grammars). Language-scoped resolution
+(symbols.lang, SCHEMA_VERSION 3). 64/64 tests, clippy clean. Python gate byte-EXACT
+(14484/4441/2029/8014). Dogfood: maple indexes bob (2167 edges) and ITSELF (mixed rs+py, 3380 edges;
+resolve_call closure verified correct). No tree-sitter bump needed (shared ABI shim). Deferred:
+per-lang exact resolvers (K3), test-file naming conventions per lang, C/C++ header-decl suspects.

@@ -147,7 +147,7 @@ instead — see their entries below.
 
 | Command | What it does |
 |---|---|
-| `maple parse <file.py>` | Parse one Python file, print its extracted defs/calls/imports as JSON. |
+| `maple parse <file>` | Parse one source file (any supported language), print its extracted defs/calls/imports as JSON. |
 | `maple index <repo>` | Cold full index of a repo into `<repo>/.maple/graph.db`. |
 | `maple status <repo>` | Print counts from an existing store without parsing anything. |
 | `maple closure <repo> --symbol <spec>` | Depth-1 closure: target definition(s) plus direct callers and callees. |
@@ -300,7 +300,8 @@ exports (module-level defs, plus classes with their methods nested) before you e
 `unparsed_files_count`) mean the graph has holes for those files — treat their absence from query
 results as "unknown," not "no callers." tree-sitter is error-tolerant, so this fires for files that
 are unreadable (permission-denied) or that parse but yield zero defs/calls/imports for non-empty
-content (a real Python file wouldn't; a data-only or misidentified file might).
+content (a real source file usually wouldn't; a data-only, misidentified, or declarations-only
+file might).
 
 ## Operations
 
@@ -339,7 +340,8 @@ The full evidence trail — methodology, fixtures, and every wave's before/after
 
 ## How it works
 
-1. **Parse.** tree-sitter turns each `.py` file into defs, call-sites, imports, and aliases.
+1. **Parse.** tree-sitter turns each source file (9 languages — see the table below) into defs,
+   call-sites, imports, and aliases.
 2. **Store.** Symbols and calls land in a SQLite graph (`<repo>/.maple/graph.db`).
 3. **Resolve.** Every call-site becomes exactly one edge, deterministically labeled `exact`,
    `ambiguous`, or `unresolved` — never a similarity score, never guessed.
@@ -348,8 +350,31 @@ The full evidence trail — methodology, fixtures, and every wave's before/after
 5. **Never drop, never trim silently.** A caller you can't resolve is labeled and kept, not
    discarded; a bundle over budget is flagged `over_budget`, not silently truncated.
 
+## Languages
+
+v1.1: 9 languages at the **universal tier** — defs (with parent class/impl-type/receiver
+containers), call-sites split func-vs-method by syntax, imports and aliases, name-based resolution
+**scoped to the caller's language** (a `.rs` call never matches a `.java` def; cross-language calls
+like FFI are honest `unresolved`). Only Python additionally has the **exact resolver** — the
+type-aware layer that binds `self.foo()` / `x = C(); x.foo()` / annotated params / one-hop
+inheritance / import-aware bare calls deterministically. Receiver hints outside Python exist only
+where the syntax hands them over for free; nothing is inferred.
+
+| Language | Extensions | Defs + containers | func/method calls | Imports/aliases | Receiver hints | Docstrings |
+|---|---|---|---|---|---|---|
+| Python | `.py` | ✓ classes | ✓ | ✓ `import`/`from`/`as` | ✓ full exact resolver (S2/T1–T4) | ✓ |
+| Rust | `.rs` | ✓ struct/enum/trait + `impl` blocks | ✓ (`X::y` counts as method) | ✓ `use`, `use .. as` | `self.foo()` in `impl T` → T | ✓ `///` |
+| C | `.c` `.h` | ✓ (no classes) | all `func` (C has no methods) | `#include` raw only | — | — |
+| C++ | `.cpp` `.cc` `.hpp` `.hh` | ✓ class/struct + out-of-line `X::y` defs | ✓ | `#include` raw only | — | — |
+| C# | `.cs` | ✓ class/interface/struct/record | ✓ | ✓ `using`, `using X = Y` | — | ✓ `///` / `/** */` |
+| Java | `.java` | ✓ class/interface/enum/record | ✓ | ✓ imports (last segment) | — | ✓ `/** */` |
+| JavaScript | `.js` `.jsx` `.mjs` `.cjs` | ✓ classes + `const x = () =>` arrows | ✓ | ✓ `import {a as b}`, defaults | — | ✓ `/** */` |
+| TypeScript | `.ts` `.tsx` | ✓ (TS + TSX grammars, one language) | ✓ | ✓ `import {a as b}`, defaults | — | ✓ `/** */` |
+| Go | `.go` | ✓ named types + method receivers | ✓ | ✓ import aliases | `w.foo()` on the receiver ident → type | — |
+
+Shallow by design: the universal tier extracts what the syntax states and resolves by name within
+the language — it over-reports `ambiguous`/`unresolved` rather than guess (C++ especially).
+
 ## Status
 
-v1: Python (universal tree-sitter tier + an exact resolver that binds `self.foo()` /
-`x = C(); x.foo()` / bare-call scoping deterministically — it narrows, never guesses).
 Spec, plan, and evidence live in `spec/code-symbol-graph/`.

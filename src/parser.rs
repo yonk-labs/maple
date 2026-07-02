@@ -1,13 +1,55 @@
-//! S1.1/S1.3/S2 — parse one Python file into syntactic facts.
+//! S1.1/S1.3/S2/L1.1 — parse one source file into syntactic facts, plus the language registry.
 //!
 //! Extracts: definitions (fn/class, with parent_class for methods), call-sites (with enclosing
 //! function, func/method kind, and a deterministic receiver-class hint), imports and import aliases.
 //! The receiver-class hint powers the S2 Python resolver: `self.foo()` -> enclosing class;
 //! `x = ClassName(); x.foo()` or `ClassName().foo()` -> ClassName (validated against the symbol
 //! table at resolution time). Manual node-walk over the stable Node API.
+//!
+//! L1.1: `LANGS` maps file extensions -> (language name, walk fn). Python's walk lives here
+//! (it alone feeds the S2 exact resolver); the 8 universal-tier walks live in `crate::langs`.
 
 use serde::Serialize;
+use std::path::Path;
 use tree_sitter::{Node, Parser};
+
+/// L1.1 — one registered language: its `lang` column value, the extensions it claims, and the walk
+/// producing the shared `ParsedFile` shape. The tree-sitter `Language` is owned by the walk fn.
+#[derive(Debug)]
+pub struct LangSpec {
+    pub name: &'static str,
+    pub extensions: &'static [&'static str],
+    pub parse: fn(&str) -> anyhow::Result<ParsedFile>,
+}
+
+/// The registry. `.ts` and `.tsx` are separate grammars but ONE language ("typescript") — a `.ts`
+/// caller may resolve into a `.tsx` def and vice versa. JS and TS stay separate languages.
+pub static LANGS: &[LangSpec] = &[
+    LangSpec { name: "python", extensions: &["py"], parse: parse_python },
+    LangSpec { name: "rust", extensions: &["rs"], parse: crate::langs::parse_rust },
+    LangSpec { name: "c", extensions: &["c", "h"], parse: crate::langs::parse_c },
+    LangSpec { name: "cpp", extensions: &["cpp", "cc", "hpp", "hh"], parse: crate::langs::parse_cpp },
+    LangSpec { name: "csharp", extensions: &["cs"], parse: crate::langs::parse_csharp },
+    LangSpec { name: "java", extensions: &["java"], parse: crate::langs::parse_java },
+    LangSpec { name: "javascript", extensions: &["js", "jsx", "mjs", "cjs"], parse: crate::langs::parse_javascript },
+    LangSpec { name: "typescript", extensions: &["ts"], parse: crate::langs::parse_typescript },
+    LangSpec { name: "typescript", extensions: &["tsx"], parse: crate::langs::parse_tsx },
+    LangSpec { name: "go", extensions: &["go"], parse: crate::langs::parse_go },
+];
+
+pub fn lang_for_path(path: &Path) -> Option<&'static LangSpec> {
+    let ext = path.extension()?.to_str()?;
+    LANGS.iter().find(|l| l.extensions.contains(&ext))
+}
+
+pub fn is_registered_ext(ext: &str) -> bool {
+    LANGS.iter().any(|l| l.extensions.contains(&ext))
+}
+
+/// ".py .rs .c ..." — for the `maple parse` unsupported-language error.
+pub fn supported_extensions_list() -> String {
+    LANGS.iter().flat_map(|l| l.extensions).map(|e| format!(".{e}")).collect::<Vec<_>>().join(" ")
+}
 
 #[derive(Serialize, Debug)]
 pub struct Definition {
@@ -175,11 +217,11 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
     Ok(out)
 }
 
-fn text<'a>(n: Node, src: &'a [u8]) -> &'a str {
+pub(crate) fn text<'a>(n: Node, src: &'a [u8]) -> &'a str {
     n.utf8_text(src).unwrap_or("")
 }
 
-fn first_line(n: Node, src: &[u8]) -> String {
+pub(crate) fn first_line(n: Node, src: &[u8]) -> String {
     text(n, src).lines().next().unwrap_or("").trim_end().to_string()
 }
 

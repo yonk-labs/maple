@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS symbols (
   id INTEGER PRIMARY KEY, file TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
   parent_class TEXT, start_line INTEGER, end_line INTEGER, signature TEXT,
-  ret_class TEXT, base_class TEXT, docstring TEXT);
+  ret_class TEXT, base_class TEXT, docstring TEXT, lang TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE TABLE IF NOT EXISTS imports (
   file TEXT NOT NULL, raw TEXT NOT NULL, line INTEGER);
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS meta (
 /// drops every table and recreates them empty, rather than risk a raw SQL error from a stale shape
 /// (e.g. a query against a column/table that doesn't exist yet). The next `index`/`refresh` rebuilds
 /// it from disk — `refresh()` on an empty-files store behaves like a cold walk (see its own doc).
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3; // v3: L1.2 — symbols.lang (language-scoped resolution)
 
 const DROP_ALL: &str = "\
 DROP TABLE IF EXISTS files;
@@ -81,6 +81,7 @@ pub struct RefreshStats {
 
 struct CallRec {
     file: String,
+    lang: &'static str, // L1.2: the caller file's language — resolution is lang-scoped
     enclosing: String,
     name: String,
     line: i64,
@@ -89,7 +90,9 @@ struct CallRec {
 }
 
 /// F8 — named alias for `refresh()`'s pass-B relabel query row (clippy::type_complexity).
-type EdgeRelabelRow = (i64, String, String, Option<i64>, String, Option<String>, String);
+/// L1.2: the trailing String is the call-site file's `files.lang` (joined in), so pass-B
+/// re-resolution stays scoped to the caller's language.
+type EdgeRelabelRow = (i64, String, String, Option<i64>, String, Option<String>, String, String);
 
 /// T13 — result of parsing one file's content off the SQLite connection (the part `rayon` runs in
 /// parallel: file read + tree-sitter, both pure/CPU, no `Connection` access). The DB-write loop
@@ -97,29 +100,34 @@ type EdgeRelabelRow = (i64, String, String, Option<i64>, String, Option<String>,
 enum ParseOutcome {
     /// T15: file couldn't even be read (e.g. permission-denied) — no hash to record.
     Unreadable(String),
-    /// `parse_python` returned `Err` — hash is still recorded so delta doesn't retry every call.
+    /// the language's walk returned `Err` — hash is still recorded so delta doesn't retry every call.
     ParseErr { hash: String, err: String },
     Ok { hash: String, parsed: crate::parser::ParsedFile, suspect: bool },
 }
 
 struct FileParse {
     rel: String,
+    lang: &'static str,
     outcome: ParseOutcome,
 }
 
 /// T13 — read + parse `path` (relative name `rel`); pure CPU work, safe to run on a rayon thread.
+/// L1.1: the walk is dispatched by extension via the registry — `path` is only ever a file the
+/// registered-extension walker yielded.
 fn parse_one_file(path: &Path, rel: String) -> FileParse {
+    let lang = crate::parser::lang_for_path(path).expect("walker only yields registered extensions");
     let outcome = match std::fs::read(path) {
         Err(e) => ParseOutcome::Unreadable(format!("unreadable: {e}")),
         Ok(bytes) => {
             let src = String::from_utf8_lossy(&bytes);
             let hash = hash_bytes(&bytes);
-            match crate::parser::parse_python(&src) {
+            match (lang.parse)(&src) {
                 Err(e) => ParseOutcome::ParseErr { hash, err: e.to_string() },
                 Ok(parsed) => {
                     // T15: tree-sitter is error-tolerant (rarely returns Err above) — a non-empty
                     // file that parses to zero defs+calls+imports is the actually-triggerable
-                    // signal that something's wrong (garbage/binary content mistaken for `.py`).
+                    // signal that something's wrong (garbage/binary content, or a source shape the
+                    // shallow walk doesn't extract anything from).
                     let suspect = parsed.defs.is_empty()
                         && parsed.calls.is_empty()
                         && parsed.imports.is_empty()
@@ -129,7 +137,7 @@ fn parse_one_file(path: &Path, rel: String) -> FileParse {
             }
         }
     };
-    FileParse { rel, outcome }
+    FileParse { rel, lang: lang.name, outcome }
 }
 
 // ---- read-side query results (S1.4) ----------------------------------------
@@ -146,12 +154,20 @@ pub struct SymRef {
     pub docstring: Option<String>,
 }
 
-/// T10.1/F4 — FQ name: module path (file minus `.py`, `/`→`.`, leading `src/` stripped) + `.` +
-/// [`<class>.`]`name` — the parent class segment is inserted when the symbol is a method, so
-/// `src/pkg/mod.py` + `Widget` + `render` -> `pkg.mod.Widget.render` instead of dropping the class.
-/// Computed at query time; display-only (never changes edge resolution, which stays name-based).
+/// L1.1 — does `p` end in a registered source extension? (The generalized `.py` check.)
+fn has_src_ext(p: &str) -> bool {
+    p.rsplit_once('.').is_some_and(|(_, ext)| crate::parser::is_registered_ext(ext))
+}
+
+/// T10.1/F4 — FQ name: module path (file minus its registered extension, `/`→`.`, leading `src/`
+/// stripped) + `.` + [`<class>.`]`name` — the parent class segment is inserted when the symbol is
+/// a method, so `src/pkg/mod.py` + `Widget` + `render` -> `pkg.mod.Widget.render` instead of
+/// dropping the class. Computed at query time; display-only (never changes edge resolution).
 fn fq_name(file: &str, name: &str, parent_class: Option<&str>) -> String {
-    let no_ext = file.strip_suffix(".py").unwrap_or(file);
+    let no_ext = match file.rsplit_once('.') {
+        Some((stem, ext)) if crate::parser::is_registered_ext(ext) => stem,
+        _ => file,
+    };
     let no_src = no_ext.strip_prefix("src/").unwrap_or(no_ext);
     let module = no_src.replace('/', ".");
     match parent_class {
@@ -160,10 +176,11 @@ fn fq_name(file: &str, name: &str, parent_class: Option<&str>) -> String {
     }
 }
 
-/// T16 — `--module` accepts a file path (`pkg/mod.py`) or a dotted path (`pkg.mod`, dots -> `/`);
-/// same convention as `lookup_targets`'s module.path.name form.
+/// T16 — `--module` accepts a file path in any registered language (`pkg/mod.py`, `src/store.rs`)
+/// or a Python dotted path (`pkg.mod`, dots -> `/` + `.py` — dotted module addressing stays a
+/// Python convention; other languages use file paths).
 fn module_to_file(module: &str) -> String {
-    if module.ends_with(".py") {
+    if has_src_ext(module) {
         module.to_string()
     } else {
         format!("{}.py", module.replace('.', "/"))
@@ -438,7 +455,7 @@ impl Store {
         Ok(Self { conn, root: repo_root.to_path_buf() })
     }
 
-    /// Cold full index: parse all Python files, persist symbols/imports, then resolve edges.
+    /// Cold full index: parse all registered-language files, persist symbols/imports, then resolve edges.
     ///
     /// F1 — CRITICAL: clearing the old graph and writing the new one happen inside ONE transaction,
     /// entered only after parsing (pure CPU, no db access) is already done. Two correctness
@@ -450,7 +467,7 @@ impl Store {
     /// back an uncommitted transaction on next open — instead of the old un-transacted `clear()`,
     /// which could wipe the graph and then be interrupted before the rebuild finished.
     pub fn index_repo(&mut self, root: &Path) -> Result<IndexStats> {
-        let files = python_files(root);
+        let files = source_files(root);
         let mut st = IndexStats::default();
 
         // T13: parse (file read + tree-sitter, pure CPU) in parallel across files; every SQLite
@@ -477,7 +494,7 @@ impl Store {
             )?;
             let mut fstmt = tx.prepare("INSERT OR REPLACE INTO files(path,hash,lang) VALUES(?1,?2,?3)")?;
             let mut sstmt = tx.prepare(
-                "INSERT INTO symbols(file,name,kind,parent_class,start_line,end_line,signature,ret_class,base_class,docstring) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                "INSERT INTO symbols(file,name,kind,parent_class,start_line,end_line,signature,ret_class,base_class,docstring,lang) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             )?;
             let mut istmt = tx.prepare("INSERT INTO imports(file,raw,line) VALUES(?1,?2,?3)")?;
             let mut nstmt =
@@ -499,12 +516,12 @@ impl Store {
                         eprintln!("! parse {}: {err}", root.join(rel).display());
                         // T15: record the hash anyway so delta doesn't retry the parse every call
                         // — only a content change re-triggers it.
-                        fstmt.execute(params![rel, hash, "python"])?;
+                        fstmt.execute(params![rel, hash, fp.lang])?;
                         pfstmt.execute(params![rel, format!("parse error: {err}")])?;
                         continue;
                     }
                     ParseOutcome::Ok { hash, parsed, suspect } => {
-                        fstmt.execute(params![rel, hash, "python"])?;
+                        fstmt.execute(params![rel, hash, fp.lang])?;
                         if *suspect {
                             pfstmt.execute(params![
                                 rel,
@@ -512,7 +529,7 @@ impl Store {
                             ])?;
                         }
                         for d in &parsed.defs {
-                            sstmt.execute(params![rel, d.name, d.kind, d.parent_class, d.start_line as i64, d.end_line as i64, d.signature, d.ret_class, d.base_class, d.docstring])?;
+                            sstmt.execute(params![rel, d.name, d.kind, d.parent_class, d.start_line as i64, d.end_line as i64, d.signature, d.ret_class, d.base_class, d.docstring, fp.lang])?;
                             let id = tx.last_insert_rowid();
                             caller_ids.entry((rel.clone(), d.name.clone())).or_insert(id);
                             st.symbols += 1;
@@ -533,6 +550,7 @@ impl Store {
                         for c in &parsed.calls {
                             calls.push(CallRec {
                                 file: rel.clone(),
+                                lang: fp.lang,
                                 enclosing: c.enclosing.clone(),
                                 name: c.name.clone(),
                                 line: c.line as i64,
@@ -559,7 +577,7 @@ impl Store {
                     .cloned()
                     .unwrap_or_else(|| c.name.clone());
                 let (callee_symbol, label) =
-                    resolve_call(&tx, &name, &c.call_kind, c.receiver_class.as_deref(), &c.file)?;
+                    resolve_call(&tx, &name, &c.call_kind, c.receiver_class.as_deref(), &c.file, c.lang)?;
                 match label {
                     "exact" => st.exact += 1,
                     "ambiguous" => st.ambiguous += 1,
@@ -773,9 +791,9 @@ impl Store {
         if let Some((file, name)) = spec.split_once("::") {
             return Ok((name.to_string(), by_file_and_name(file, name, false)?));
         }
-        // path.py:LINE -> innermost def whose span contains the line
+        // path.<ext>:LINE -> innermost def whose span contains the line (any registered language)
         if let Some((file, line)) = spec.rsplit_once(':') {
-            if let (true, Ok(l)) = (file.ends_with(".py"), line.parse::<i64>()) {
+            if let (true, Ok(l)) = (has_src_ext(file), line.parse::<i64>()) {
                 let mut stmt = self.conn.prepare(
                     "SELECT id,name,file,start_line,end_line,signature,docstring,parent_class FROM symbols \
                      WHERE (file=?1 OR file LIKE '%/' || ?1) AND start_line<=?2 AND end_line>=?2 \
@@ -887,7 +905,10 @@ impl Store {
                 if stored_head.as_deref() == Some(head.as_str()) {
                     if let Some(status) = git_status_porcelain(&root) {
                         candidate_paths = Some(
-                            parse_porcelain_paths(&status).into_iter().filter(|p| p.ends_with(".py")).collect(),
+                            parse_porcelain_paths(&status)
+                                .into_iter()
+                                .filter(|p| crate::parser::lang_for_path(Path::new(p)).is_some())
+                                .collect(),
                         );
                     }
                 }
@@ -925,7 +946,7 @@ impl Store {
             (changed, deleted)
         } else {
             // fallback: non-git repo, a git error, or HEAD moved — walk + hash everything.
-            for path in python_files(&root) {
+            for path in source_files(&root) {
                 let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
                 match std::fs::read(&path) {
                     Ok(bytes) => {
@@ -981,14 +1002,16 @@ impl Store {
         }
 
         // T13: re-parse changed files' content in parallel (already read+hashed above — this is
-        // pure CPU: just `parse_python`); the DB-write loop below stays single-threaded and in the
-        // same `changed` order as before.
-        let parsed_changed: Vec<(String, ParseOutcome)> = changed
+        // pure CPU: just the language's walk); the DB-write loop below stays single-threaded and
+        // in the same `changed` order as before.
+        let parsed_changed: Vec<(String, &'static str, ParseOutcome)> = changed
             .par_iter()
             .map(|f| {
+                let lang =
+                    crate::parser::lang_for_path(Path::new(f)).expect("changed set only holds registered files");
                 let (hash, bytes) = &disk[f];
                 let src = String::from_utf8_lossy(bytes);
-                let outcome = match crate::parser::parse_python(&src) {
+                let outcome = match (lang.parse)(&src) {
                     Err(e) => ParseOutcome::ParseErr { hash: hash.clone(), err: e.to_string() },
                     Ok(parsed) => {
                         let suspect = parsed.defs.is_empty()
@@ -998,7 +1021,7 @@ impl Store {
                         ParseOutcome::Ok { hash: hash.clone(), parsed, suspect }
                     }
                 };
-                (f.clone(), outcome)
+                (f.clone(), lang.name, outcome)
             })
             .collect();
 
@@ -1006,14 +1029,14 @@ impl Store {
         let mut calls: Vec<CallRec> = Vec::new();
         let mut alias_maps: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut caller_ids: HashMap<(String, String), i64> = HashMap::new();
-        for (f, outcome) in &parsed_changed {
+        for (f, lang, outcome) in &parsed_changed {
             let (hash, parsed, suspect) = match outcome {
                 ParseOutcome::Unreadable(_) => unreachable!("`changed` files were just read successfully above"),
                 ParseOutcome::ParseErr { hash, err } => {
                     eprintln!("! parse {f}: {err}");
                     // T15: still record the hash so delta doesn't retry this parse every call —
                     // pass A already cleared any stale parse_failures row for this path.
-                    tx.execute("INSERT OR REPLACE INTO files(path,hash,lang) VALUES(?1,?2,'python')", params![f, hash])?;
+                    tx.execute("INSERT OR REPLACE INTO files(path,hash,lang) VALUES(?1,?2,?3)", params![f, hash, lang])?;
                     tx.execute(
                         "INSERT INTO parse_failures(file,error) VALUES(?1,?2)",
                         params![f, format!("parse error: {err}")],
@@ -1022,7 +1045,7 @@ impl Store {
                 }
                 ParseOutcome::Ok { hash, parsed, suspect } => (hash, parsed, *suspect),
             };
-            tx.execute("INSERT OR REPLACE INTO files(path,hash,lang) VALUES(?1,?2,'python')", params![f, hash])?;
+            tx.execute("INSERT OR REPLACE INTO files(path,hash,lang) VALUES(?1,?2,?3)", params![f, hash, lang])?;
             if suspect {
                 tx.execute(
                     "INSERT INTO parse_failures(file,error) VALUES(?1,?2)",
@@ -1031,8 +1054,8 @@ impl Store {
             }
             for d in &parsed.defs {
                 tx.execute(
-                    "INSERT INTO symbols(file,name,kind,parent_class,start_line,end_line,signature,ret_class,base_class,docstring) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                    params![f, d.name, d.kind, d.parent_class, d.start_line as i64, d.end_line as i64, d.signature, d.ret_class, d.base_class, d.docstring],
+                    "INSERT INTO symbols(file,name,kind,parent_class,start_line,end_line,signature,ret_class,base_class,docstring,lang) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    params![f, d.name, d.kind, d.parent_class, d.start_line as i64, d.end_line as i64, d.signature, d.ret_class, d.base_class, d.docstring, lang],
                 )?;
                 let id = tx.last_insert_rowid();
                 affected.insert(d.name.clone());
@@ -1054,6 +1077,7 @@ impl Store {
             for c in &parsed.calls {
                 calls.push(CallRec {
                     file: f.clone(),
+                    lang,
                     enclosing: c.enclosing.clone(),
                     name: c.name.clone(),
                     line: c.line as i64,
@@ -1071,7 +1095,7 @@ impl Store {
                 .cloned()
                 .unwrap_or_else(|| c.name.clone());
             let (callee, label) =
-                resolve_call(&tx, &name, &c.call_kind, c.receiver_class.as_deref(), &c.file)?;
+                resolve_call(&tx, &name, &c.call_kind, c.receiver_class.as_deref(), &c.file, c.lang)?;
             let caller = caller_ids.get(&(c.file.clone(), c.enclosing.clone())).copied();
             tx.execute(
                 "INSERT INTO edges(caller_symbol,callee_symbol,callee_name,kind,call_kind,receiver_class,call_site_file,call_site_line) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -1083,20 +1107,24 @@ impl Store {
         // matched by callee_name OR receiver_class (a class rename shifts its methods' resolution too).
         // Per-edge, because resolution depends on stored call_kind + receiver_class context.
         {
+            // L1.2: join `files` for each edge's language — pass-B re-resolution must stay scoped
+            // to the caller file's language, same as the original resolution.
             let mut sel = tx.prepare(
-                "SELECT rowid, callee_name, kind, callee_symbol, call_kind, receiver_class, call_site_file \
-                 FROM edges WHERE callee_name=?1 OR receiver_class=?1",
+                "SELECT e.rowid, e.callee_name, e.kind, e.callee_symbol, e.call_kind, e.receiver_class, \
+                        e.call_site_file, f.lang \
+                 FROM edges e JOIN files f ON e.call_site_file=f.path \
+                 WHERE e.callee_name=?1 OR e.receiver_class=?1",
             )?;
             let mut upd = tx.prepare("UPDATE edges SET kind=?1, callee_symbol=?2 WHERE rowid=?3")?;
             for name in &affected {
                 let rows: Vec<EdgeRelabelRow> = sel
                     .query_map([name], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
                     })?
                     .collect::<std::result::Result<_, _>>()?;
-                for (rowid, callee_name, old_kind, old_sym, call_kind, receiver_class, call_site_file) in rows {
+                for (rowid, callee_name, old_kind, old_sym, call_kind, receiver_class, call_site_file, lang) in rows {
                     let (callee, label) =
-                        resolve_call(&tx, &callee_name, &call_kind, receiver_class.as_deref(), &call_site_file)?;
+                        resolve_call(&tx, &callee_name, &call_kind, receiver_class.as_deref(), &call_site_file, &lang)?;
                     if label != old_kind || callee != old_sym {
                         upd.execute(params![label, callee, rowid])?;
                         st.relabeled += 1;
@@ -1506,9 +1534,13 @@ fn strip_ab_prefix(p: &str) -> Option<String> {
 /// Resolve a (post-alias) call against the symbols table: (callee_symbol, label).
 /// The label domain is exactly {exact, ambiguous, unresolved} — never a score (N2).
 ///
-/// Universal tier: candidate set = all defs with this name. S2/T1-T4 Python resolver (in-process
-/// seam), narrowing ONLY — never widens or drops (D0), falls back to the universal answer when a
-/// rule doesn't apply:
+/// L1.2: resolution is LANGUAGE-SCOPED — every candidate query filters to the CALLER's language,
+/// so a `.rs` call can never match a `.java` def. Cross-language calls (FFI, subprocess) are
+/// honest `unresolved`.
+///
+/// Universal tier: candidate set = all same-language defs with this name. S2/T1-T4 Python resolver
+/// (in-process seam), narrowing ONLY — never widens or drops (D0), falls back to the universal
+/// answer when a rule doesn't apply:
 ///  - method call with a receiver-class hint (self.foo / x = C(); x.foo / C().foo / T1 type
 ///    annotations / T2 self.attr): filter to methods of that class — applied only when the hint
 ///    uniquely names one class symbol. If the class doesn't define it itself, T4 tries exactly one
@@ -1522,10 +1554,12 @@ fn resolve_call(
     call_kind: &str,
     receiver_class: Option<&str>,
     call_site_file: &str,
+    lang: &str,
 ) -> Result<(Option<i64>, &'static str)> {
-    let mut stmt = conn.prepare_cached("SELECT id, parent_class, file FROM symbols WHERE name=?1")?;
+    let mut stmt =
+        conn.prepare_cached("SELECT id, parent_class, file FROM symbols WHERE name=?1 AND lang=?2")?;
     let cands: Vec<(i64, Option<String>, String)> = stmt
-        .query_map([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map(params![name, lang], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
     if cands.is_empty() {
         return Ok((None, "unresolved"));
@@ -1533,10 +1567,10 @@ fn resolve_call(
 
     if call_kind == "method" {
         if let Some(rc) = receiver_class {
-            // hint is trusted only if `rc` names exactly one symbol and it's a class
-            let mut cstmt = conn.prepare_cached("SELECT kind FROM symbols WHERE name=?1 LIMIT 2")?;
+            // hint is trusted only if `rc` names exactly one same-language symbol and it's a class
+            let mut cstmt = conn.prepare_cached("SELECT kind FROM symbols WHERE name=?1 AND lang=?2 LIMIT 2")?;
             let kinds: Vec<String> = cstmt
-                .query_map([rc], |r| r.get(0))?
+                .query_map(params![rc, lang], |r| r.get(0))?
                 .collect::<std::result::Result<_, _>>()?;
             if kinds.is_empty() {
                 // W2.1: `rc` is provably external (builtin, or an import whose source module has
@@ -1546,7 +1580,8 @@ fn resolve_call(
                 // Only displaces the would-be-AMBIGUOUS fallback (cands.len() > 1): exact must not
                 // decrease (D0 constitution), so a lone same-named in-repo candidate keeps its
                 // existing exact match even when the receiver is external.
-                if cands.len() > 1 && is_external_receiver(conn, rc, call_site_file)? {
+                // L1.2: Python-only — the builtin list and import-module matching are Python facts.
+                if cands.len() > 1 && lang == "python" && is_external_receiver(conn, rc, call_site_file)? {
                     return Ok((None, "unresolved"));
                 }
             } else if kinds.len() == 1 && kinds[0] == "class" {
@@ -1557,7 +1592,7 @@ fn resolve_call(
                     n if n > 1 => return Ok((None, "ambiguous")),
                     _ => {
                         // T4: rc doesn't define it itself — try exactly one inheritance hop
-                        if let Some(hit) = base_class_hop(conn, rc, &cands)? {
+                        if let Some(hit) = base_class_hop(conn, rc, &cands, lang)? {
                             return Ok(hit);
                         }
                     } // no base, ambiguous base, or base lacks it -> universal fallback
@@ -1615,16 +1650,17 @@ fn base_class_hop(
     conn: &Connection,
     rc: &str,
     cands: &[(i64, Option<String>, String)],
+    lang: &str,
 ) -> Result<Option<(Option<i64>, &'static str)>> {
     let base: Option<String> = conn
-        .prepare_cached("SELECT base_class FROM symbols WHERE name=?1 AND kind='class' LIMIT 1")?
-        .query_row([rc], |r| r.get(0))
+        .prepare_cached("SELECT base_class FROM symbols WHERE name=?1 AND kind='class' AND lang=?2 LIMIT 1")?
+        .query_row(params![rc, lang], |r| r.get(0))
         .optional()?
         .flatten();
     let Some(b) = base else { return Ok(None) };
-    let mut cstmt = conn.prepare_cached("SELECT kind FROM symbols WHERE name=?1 LIMIT 2")?;
+    let mut cstmt = conn.prepare_cached("SELECT kind FROM symbols WHERE name=?1 AND lang=?2 LIMIT 2")?;
     let kinds: Vec<String> =
-        cstmt.query_map([&b], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        cstmt.query_map(params![&b, lang], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
     if kinds.len() != 1 || kinds[0] != "class" {
         return Ok(None);
     }
@@ -1737,7 +1773,9 @@ fn hash_bytes(b: &[u8]) -> String {
     format!("{:016x}", h.finish())
 }
 
-fn python_files(root: &Path) -> Vec<PathBuf> {
+/// L1.1 — every file under `root` (skip dirs excluded) whose extension is registered in
+/// `parser::LANGS`. The generalized `python_files` walker.
+fn source_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     fn rec(dir: &Path, out: &mut Vec<PathBuf>) {
         let rd = match std::fs::read_dir(dir) {
@@ -1751,7 +1789,7 @@ fn python_files(root: &Path) -> Vec<PathBuf> {
                 if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
                     rec(&p, out);
                 }
-            } else if p.extension().is_some_and(|x| x == "py") {
+            } else if crate::parser::lang_for_path(&p).is_some() {
                 out.push(p);
             }
         }
@@ -3030,5 +3068,292 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    // ---- L1.4 — per-language universal-tier fixtures ---------------------------------------
+
+    /// (edge kind, call_kind) for the edge named `callee` whose enclosing caller is `encl`.
+    fn edge_kinds(s: &Store, callee: &str, encl: &str) -> (String, String) {
+        s.conn
+            .query_row(
+                "SELECT e.kind, e.call_kind FROM edges e LEFT JOIN symbols c ON e.caller_symbol=c.id \
+                 WHERE e.callee_name=?1 AND c.name=?2",
+                params![callee, encl],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn parent_of(s: &Store, name: &str) -> Option<String> {
+        s.conn
+            .query_row("SELECT parent_class FROM symbols WHERE name=?1", [name], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind
+    /// `method` with the free `self`-in-`impl` receiver hint; defs carry the impl-type container.
+    #[test]
+    fn l1_rust_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub fn helper() -> i32 { 1 }\n\
+             pub fn plain() -> i32 { 2 }\n\
+             pub struct Widget { pub val: i32 }\n\
+             impl Widget {\n    pub fn render(&self) -> i32 { self.helper_method() }\n    fn helper_method(&self) -> i32 { helper() }\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("app.rs"), "use crate::lib::helper as h;\nfn run() { h(); plain(); }\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "plain", "run"), ("exact".into(), Some("lib.rs".into())), "cross-file func call");
+        assert_eq!(resolved(&s, "helper", "run"), ("exact".into(), Some("lib.rs".into())), "use-as alias binds");
+        assert_eq!(edge_kinds(&s, "helper_method", "render"), ("exact".into(), "method".into()), "self.x() -> method + impl-type hint");
+        assert_eq!(parent_of(&s, "render").as_deref(), Some("Widget"), "method def carries impl type");
+        let widget_kind: String =
+            s.conn.query_row("SELECT kind FROM symbols WHERE name='Widget'", [], |r| r.get(0)).unwrap();
+        assert_eq!(widget_kind, "class", "struct is a class-kind container");
+    }
+
+    /// L1.4 Go — cross-file func call exact; `w.foo()` on the method's own receiver ident gets the
+    /// receiver-type hint and lands kind `method`; defs carry the receiver type as parent.
+    #[test]
+    fn l1_go_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.go"),
+            "package main\n\nfunc Helper() int { return 1 }\n\ntype Widget struct{ Val int }\n\n\
+             func (w *Widget) Render() int { return w.helperMethod() }\n\n\
+             func (w *Widget) helperMethod() int { return Helper() }\n",
+        )
+        .unwrap();
+        fs::write(root.join("app.go"), "package main\n\nfunc Run() int { return Helper() }\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "Helper", "Run"), ("exact".into(), Some("lib.go".into())), "cross-file func call");
+        assert_eq!(edge_kinds(&s, "helperMethod", "Render"), ("exact".into(), "method".into()), "receiver ident -> hint -> exact");
+        assert_eq!(parent_of(&s, "Render").as_deref(), Some("Widget"), "method def carries receiver type");
+    }
+
+    /// L1.4 C — cross-file func call exact; C has no methods: `s->fn()` stays kind `func`
+    /// (honest `unresolved` when nothing defines it); #include recorded as a raw import.
+    #[test]
+    fn l1_c_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("lib.c"), "int helper(int x) { return x + 1; }\n").unwrap();
+        fs::write(
+            root.join("app.c"),
+            "#include \"lib.h\"\nint run(void) { return helper(1); }\n\
+             int use_fp(struct S* s) { return s->fn(2); }\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "helper", "run"), ("exact".into(), Some("lib.c".into())), "cross-file func call");
+        assert_eq!(edge_kinds(&s, "fn", "use_fp"), ("unresolved".into(), "func".into()), "C member call stays func");
+        let imports: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM imports WHERE file='app.c'", [], |r| r.get(0)).unwrap();
+        assert_eq!(imports, 1, "#include recorded as raw import");
+    }
+
+    /// L1.4 C++ — cross-file func call exact; member call lands kind `method`; class-body methods
+    /// AND out-of-line `X::y` definitions both carry the class as parent.
+    #[test]
+    fn l1_cpp_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.cpp"),
+            "int helper(int x) { return x + 1; }\n\
+             class Widget {\npublic:\n    int go() { return helper_method(); }\n    int helper_method() { return 1; }\n};\n\
+             int Widget::extra() { return 42; }\n",
+        )
+        .unwrap();
+        fs::write(root.join("app.cpp"), "int run() { return helper(1); }\nint use(Widget& w) { return w.go(); }\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "helper", "run"), ("exact".into(), Some("lib.cpp".into())), "cross-file func call");
+        assert_eq!(edge_kinds(&s, "go", "use"), ("exact".into(), "method".into()), "member call -> method");
+        assert_eq!(parent_of(&s, "go").as_deref(), Some("Widget"), "in-class method carries class");
+        assert_eq!(parent_of(&s, "extra").as_deref(), Some("Widget"), "out-of-line X::y carries class");
+    }
+
+    /// L1.4 C# — cross-file func-kind call exact; member call lands kind `method`; methods carry
+    /// their class.
+    #[test]
+    fn l1_csharp_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("Lib.cs"),
+            "class Widget {\n    public int Go() { return HelperMethod(); }\n    public int HelperMethod() { return 1; }\n}\n\
+             class Util {\n    public static int Helper(int x) { return x + 1; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("App.cs"),
+            "class Program {\n    static int Run() { return Helper(1); }\n    static void Use(Widget w) { w.Go(); }\n}\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "Helper", "Run"), ("exact".into(), Some("Lib.cs".into())), "cross-file func call");
+        assert_eq!(edge_kinds(&s, "Go", "Use"), ("exact".into(), "method".into()), "member call -> method");
+        assert_eq!(parent_of(&s, "Go").as_deref(), Some("Widget"), "method def carries class");
+    }
+
+    /// L1.4 Java — cross-file func-kind call exact; `x.foo()` lands kind `method`; methods carry
+    /// their class; imports record the last segment (import_names).
+    #[test]
+    fn l1_java_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("Lib.java"),
+            "class Widget {\n    int go() { return helperMethod(); }\n    int helperMethod() { return 1; }\n}\n\
+             class MathUtil {\n    static int compute(int x) { return x + 1; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("App.java"),
+            "import util.MathUtil;\nclass App {\n    int run(Widget w) { return w.go(); }\n    int calc() { return compute(1); }\n}\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "compute", "calc"), ("exact".into(), Some("Lib.java".into())), "cross-file func call");
+        assert_eq!(edge_kinds(&s, "go", "run"), ("exact".into(), "method".into()), "x.foo() -> method");
+        assert_eq!(parent_of(&s, "go").as_deref(), Some("Widget"), "method def carries class");
+        let (local, module): (String, String) = s
+            .conn
+            .query_row("SELECT local, source_module FROM import_names WHERE file='App.java'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((local.as_str(), module.as_str()), ("MathUtil", "util"), "import last segment recorded");
+    }
+
+    /// L1.4 JavaScript — `import { x as y }` alias binds cross-file exact; `this.foo()` lands kind
+    /// `method`; `const x = () =>` arrow is a def; class methods carry their class.
+    #[test]
+    fn l1_javascript_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.js"),
+            "export function helper(x) { return x + 1; }\n\
+             export const arrow = (x) => helper(x);\n\
+             export class Widget {\n    go() { this.helperMethod(); return 1; }\n    helperMethod() { return 1; }\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("app.js"), "import { helper as h } from \"./lib.js\";\nfunction run() { return h(1); }\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "helper", "run"), ("exact".into(), Some("lib.js".into())), "import-as alias binds");
+        assert_eq!(edge_kinds(&s, "helperMethod", "go"), ("exact".into(), "method".into()), "this.foo() -> method");
+        assert_eq!(parent_of(&s, "go").as_deref(), Some("Widget"), "method def carries class");
+        // the arrow fn is a def, and the call inside it is attributed to it
+        assert_eq!(resolved(&s, "helper", "arrow").0, "exact", "arrow fn encloses its calls");
+    }
+
+    /// L1.4 TypeScript + TSX — two grammars, ONE language: a `.tsx` caller resolves into a `.ts`
+    /// def exactly (import-as alias); method call lands kind `method`; methods carry their class.
+    #[test]
+    fn l1_typescript_tsx_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.ts"),
+            "export function helper(x: number): number { return x + 1; }\n\
+             export class Widget {\n    go(): number { this.helperMethod(); return 1; }\n    helperMethod(): number { return 1; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app.tsx"),
+            "import { helper as h } from \"./lib\";\nexport function App() {\n    return <div>{h(1)}</div>;\n}\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "helper", "App"), ("exact".into(), Some("lib.ts".into())), ".tsx caller -> .ts def (one language)");
+        assert_eq!(edge_kinds(&s, "helperMethod", "go"), ("exact".into(), "method".into()), "this.foo() -> method");
+        assert_eq!(parent_of(&s, "go").as_deref(), Some("Widget"), "method def carries class");
+    }
+
+    /// L1.2 — polyglot language scoping: the same fn name defined in `.py` AND `.rs`; each caller
+    /// resolves ONLY to its own language's def — exact on both sides, no cross-language ambiguity.
+    #[test]
+    fn l1_polyglot_language_scoping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.py"), "def shared():\n    return 1\n").unwrap();
+        fs::write(root.join("b.py"), "def py_caller():\n    shared()\n").unwrap();
+        fs::write(root.join("a.rs"), "pub fn shared() -> i32 { 1 }\n").unwrap();
+        fs::write(root.join("b.rs"), "fn rs_caller() { shared(); }\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM symbols WHERE name='shared'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "two same-named defs across languages");
+        assert_eq!(resolved(&s, "shared", "py_caller"), ("exact".into(), Some("a.py".into())), "python caller -> python def only");
+        assert_eq!(resolved(&s, "shared", "rs_caller"), ("exact".into(), Some("a.rs".into())), "rust caller -> rust def only");
+    }
+
+    /// L1.4 — delta==rebuild equivalence on a MIXED-language repo: a Rust-only rename relabels the
+    /// Rust edge (and leaves Python/Go untouched), a Go file is deleted, a new Rust def resolves
+    /// the dangling call again — and after all of it the delta-maintained graph equals a fresh
+    /// cold rebuild.
+    #[test]
+    fn l1_mixed_language_delta_equals_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("lib.py"), "def target():\n    return 1\n").unwrap();
+        fs::write(root.join("app.py"), "def py_use():\n    return target()\n").unwrap();
+        fs::write(root.join("lib.rs"), "pub fn target() -> i32 { 1 }\n").unwrap();
+        fs::write(root.join("app.rs"), "fn rs_use() { target(); }\n").unwrap();
+        fs::write(root.join("lib.go"), "package main\n\nfunc Target() int { return 1 }\n").unwrap();
+        fs::write(root.join("app.go"), "package main\n\nfunc GoUse() int { return Target() }\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "target", "py_use").0, "exact");
+        assert_eq!(resolved(&s, "target", "rs_use").0, "exact");
+        assert_eq!(resolved(&s, "Target", "GoUse").0, "exact");
+
+        // rename the Rust def ONLY -> the Rust edge (unchanged caller file) relabels unresolved;
+        // the same-named Python edge is untouched (language scoping in pass-B too)
+        fs::write(root.join("lib.rs"), "pub fn target2() -> i32 { 1 }\n").unwrap();
+        let st = s.refresh().unwrap();
+        assert_eq!(st.changed, 1, "only lib.rs re-parsed");
+        assert_eq!(resolved(&s, "target", "rs_use").0, "unresolved", "rust rename relabels the rust edge");
+        assert_eq!(resolved(&s, "target", "py_use").0, "exact", "python edge untouched by the rust rename");
+
+        // delete the Go lib -> its edge dangles honestly
+        fs::remove_file(root.join("lib.go")).unwrap();
+        let st2 = s.refresh().unwrap();
+        assert_eq!(st2.deleted, 1);
+        assert_eq!(resolved(&s, "Target", "GoUse").0, "unresolved");
+
+        // a new Rust file re-defines target -> the dangling Rust call resolves again
+        fs::write(root.join("new.rs"), "pub fn target() -> i32 { 3 }\n").unwrap();
+        s.refresh().unwrap();
+        assert_eq!(resolved(&s, "target", "rs_use"), ("exact".into(), Some("new.rs".into())));
+
+        // EQUIVALENCE: delta-maintained mixed-language graph == from-scratch rebuild
+        let delta_proj = graph_projection(&s);
+        let mut s2 = Store::open(root).unwrap();
+        s2.index_repo(root).unwrap();
+        assert_eq!(delta_proj, graph_projection(&s2), "mixed-language delta == rebuild");
     }
 }

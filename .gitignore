@@ -15,3 +15,4 @@ spike/**/__pycache__/
 # agent tooling (skill output, local Claude config) — not part of the shipped project
 skill-output/
 .claude/
+**/__pycache__/

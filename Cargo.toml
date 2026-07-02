@@ -9,11 +9,23 @@ readme = "README.md"
 keywords = ["code-graph", "llm", "agents", "tree-sitter", "context"]
 categories = ["command-line-utilities", "development-tools"]
 
-# tree-sitter and tree-sitter-python must be ABI-compatible; if `cargo build` errors on a version
-# mismatch, align them (the grammar crate's tree-sitter dep must match the tree-sitter version).
+# L1.1: grammar crates all resolve to one shared `tree-sitter-language` v0.1.x ABI shim (see
+# `cargo tree -i tree-sitter-language`) regardless of their own declared `tree-sitter` version, so no
+# workspace `tree-sitter` bump was needed to add the 8 new languages — tree-sitter-python (0.23)
+# stayed untouched. If a future grammar crate breaks that shim compatibility, `cargo build` fails
+# with a `Language`/`LanguageFn` type mismatch; resolve by bumping `tree-sitter` and re-checking
+# `cargo tree -i tree-sitter-language` for a single unified version.
 [dependencies]
 tree-sitter = "0.25"
 tree-sitter-python = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }

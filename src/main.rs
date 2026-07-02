@@ -1,7 +1,9 @@
-//! maple CLI — parses Python source into an exact caller/callee graph and serves it as JSON:
-//! `parse` a single file, `index`/`refresh` a repo into `.maple/graph.db`, then query it with
-//! `closure`, `enumerate`, `bundle`, `exists`, `surface`, `impact`, or serve it live over MCP.
+//! maple CLI — parses source (9 languages, see `parser::LANGS`) into an exact caller/callee graph
+//! and serves it as JSON: `parse` a single file, `index`/`refresh` a repo into `.maple/graph.db`,
+//! then query it with `closure`, `enumerate`, `bundle`, `exists`, `surface`, `impact`, or serve it
+//! live over MCP.
 
+mod langs;
 mod mcp;
 mod parser;
 mod store;
@@ -23,7 +25,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Parse one Python file and print extracted symbols (defs/calls/imports) as JSON.
+    /// Parse one source file (any registered language) and print extracted symbols
+    /// (defs/calls/imports) as JSON.
     Parse { path: String },
     /// Cold full index of a repo into <repo>/.maple/graph.db.
     Index { repo: String },
@@ -207,9 +210,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Parse { path } => {
-            require_python(&path)?;
+            let lang = require_supported(&path)?;
             let src = fs::read_to_string(&path)?;
-            let parsed = parser::parse_python(&src)?;
+            let parsed = (lang.parse)(&src)?;
             println!("{}", serde_json::to_string_pretty(&parsed)?);
         }
         Cmd::Index { repo } => {
@@ -290,13 +293,11 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// T10.4 — v1 only parses Python; a non-`.py` path is a clear config error, not silent garbage.
-fn require_python(path: &str) -> anyhow::Result<()> {
-    if path.ends_with(".py") {
-        Ok(())
-    } else {
-        anyhow::bail!("unsupported language for {path}; v1 parses Python")
-    }
+/// T10.4/L1.1 — an unregistered extension is a clear config error, not silent garbage.
+fn require_supported(path: &str) -> anyhow::Result<&'static parser::LangSpec> {
+    parser::lang_for_path(Path::new(path)).ok_or_else(|| {
+        anyhow::anyhow!("unsupported language for {path}; supported: {}", parser::supported_extensions_list())
+    })
 }
 
 #[cfg(test)]
@@ -344,12 +345,17 @@ mod tests {
         assert_eq!(narrow.meta.tokenizer, "approx");
     }
 
-    /// T10.4 — `maple parse` on a non-`.py` file is a clear error, not silent mis-parsing.
+    /// T10.4/L1.1 — `maple parse` on an unregistered extension is a clear error listing the
+    /// supported set; every registered extension resolves to its language.
     #[test]
     fn t10_unknown_language_errors() {
-        let err = require_python("foo.rs").unwrap_err();
+        let err = require_supported("foo.txt").unwrap_err();
         assert!(err.to_string().contains("unsupported language"), "{err}");
-        assert!(require_python("foo.py").is_ok());
+        assert!(err.to_string().contains(".py") && err.to_string().contains(".rs"), "{err}");
+        assert_eq!(require_supported("foo.py").unwrap().name, "python");
+        assert_eq!(require_supported("foo.rs").unwrap().name, "rust");
+        assert_eq!(require_supported("foo.tsx").unwrap().name, "typescript");
+        assert_eq!(require_supported("foo.h").unwrap().name, "c");
     }
 
     /// T15 — the shared parse-failure line: silent when there's nothing to report, and always uses
