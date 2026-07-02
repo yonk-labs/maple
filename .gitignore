@@ -1,0 +1,17 @@
+# Rust
+/target
+# T14: Cargo.lock is committed — maple is a binary crate, not a library (lockfile pins the build)
+
+# maple store
+.maple/
+
+# spike venv
+spike/.venv/
+spike/**/__pycache__/
+
+# OS
+.DS_Store
+
+# agent tooling (skill output, local Claude config) — not part of the shipped project
+skill-output/
+.claude/
