@@ -5,6 +5,7 @@
 # Idempotent: re-running updates everything in place. Nothing here needs sudo.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 BIN="$HOME/.local/bin"
 SRC="${YONK_SRC:-$HOME/yonk-tools}"
 ENDPOINT="${1:-}"
@@ -109,3 +110,16 @@ Done. Try it:
   maple bundle /path/to/repo --symbol some_function --format prompt
   cd /path/to/repo && bob build "fix the failing test X"   # add a bob.yaml with verify gates first
 EOF
+
+# 7) Offer the interactive setup wizard for multi-service/multi-role setup
+# (adding OpenAI/Anthropic/other cloud services, a frontier tier, a distinct
+# judge model — this installer only ever configures the one local endpoint above).
+WIZARD="$SCRIPT_DIR/setup-wizard.py"
+if [ -f "$WIZARD" ] && command -v python3 >/dev/null 2>&1; then
+  printf '\nRun the interactive setup wizard now to add more services or assign roles (goose/abe/bob)? [y/N] '
+  read -r RUN_WIZARD || true
+  case "${RUN_WIZARD:-}" in
+    [yY]*) python3 "$WIZARD" ;;
+    *) echo "   skipped. Run it later with: python3 $WIZARD" ;;
+  esac
+fi
