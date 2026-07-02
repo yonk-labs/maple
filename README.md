@@ -29,6 +29,18 @@ output; nothing here assumes that stack.
 
 ## Install
 
+**The whole pipeline, one command** (maple + [bob](https://github.com/yonk-labs/bob) + [abe](https://github.com/yonk-labs/abe) + [hector](https://github.com/yonk-labs/hector) + [goose](https://github.com/block/goose), built, configured, and on your PATH — asks one question: where your model server is):
+
+```bash
+git clone https://github.com/yonk-labs/maple && bash maple/scripts/install-pipeline.sh
+```
+
+It installs Rust if needed, auto-detects your endpoint's model, pre-flights structured tool-calls
+(and configures the goose toolshim fallback if your server can't), and never overwrites configs you
+already have. Re-run any time to update everything.
+
+**Just maple:**
+
 Requires a stable Rust toolchain (any recent stable `rustc`/`cargo` — no nightly features used).
 
 ```bash
