@@ -1,0 +1,714 @@
+//! L2 — SQL-dialect walks: T-SQL (`tree-sitter-sequel-tsql`), PostgreSQL (`tree-sitter-postgres`,
+//! outer grammar + its bundled plpgsql grammar for dollar-quoted bodies), Oracle PL/SQL
+//! (`tree-sitter-plsql`, pinned git rev). Universal tier only, shallow and honest:
+//! - defs: `CREATE PROCEDURE/FUNCTION/TRIGGER` -> `function` (parent = schema/package where the
+//!   name is qualified); Oracle packages (spec and body) -> `class` containers; package BODY
+//!   members carry `parent_class` = package. Spec/forward DECLARATIONS emit no def (C-header honesty).
+//! - calls: bare `proc(x)` / `CALL` / `EXEC` / `PERFORM` -> kind `func`; qualified
+//!   `pkg.proc()` / `schema.fn()` -> kind `method` on the member name. No receiver hints (nothing
+//!   is syntactically free in SQL). Dynamic SQL stays unextracted (honest unresolved-by-absence).
+//! - identifiers fold case in every dialect, so every extracted name is lowercased (`norm`); the
+//!   store's case-sensitive resolution needs no change.
+//! - common builtins (`count`, `nvl`, `getdate`, ...) are skipped at extraction so query-embedded
+//!   calls don't flood the graph with unresolved edges — each list is a small documented const,
+//!   extend freely.
+//! - a file that parses clean but defines no symbols (DDL-only migration) sets `symbolless_ok`,
+//!   suppressing the store's "suspect" flag.
+
+use crate::langs::{find_child, tree_for, walk_children};
+use crate::parser::{first_line, text, CallSite, Definition, ParsedFile};
+use tree_sitter::{Node, Parser, Tree};
+
+/// SQL identifiers are case-insensitive (pg folds down, Oracle/T-SQL fold up) — lowercase every
+/// def/call/parent name at extraction. Quoting (`"X"`, `[X]`, backticks) is stripped and quoted
+/// mixed-case identifiers fold too.
+/// ponytail: quote-preserved case (rare in proc code) would need store-side collation — revisit
+/// only if a real corpus needs it.
+fn norm(s: &str) -> String {
+    s.trim().trim_matches(|c| matches!(c, '"' | '[' | ']' | '`')).to_lowercase()
+}
+
+fn mk_def(name: &str, kind: &str, parent: Option<&str>, node: Node, src: &[u8]) -> Definition {
+    Definition {
+        name: norm(name),
+        kind: kind.into(),
+        parent_class: parent.map(norm),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        signature: first_line(node, src),
+        ret_class: None,
+        base_class: None,
+        docstring: None,
+    }
+}
+
+fn push_call(out: &mut ParsedFile, builtins: &[&str], raw: &str, kind: &str, line: usize, enclosing: &str) {
+    let name = norm(raw);
+    if name.is_empty() || builtins.contains(&name.as_str()) {
+        return;
+    }
+    out.calls.push(CallSite {
+        name,
+        kind: kind.into(),
+        line,
+        enclosing: enclosing.to_string(),
+        receiver_class: None,
+    });
+}
+
+/// Calls under a parse-ERROR node are recovery artifacts (real corpora produced "callees" like
+/// `rem` — a SQL*Plus directive — and word fragments), so call extraction skips error regions.
+/// Defs still extract there: their names come from field-anchored nodes and error-wrapped
+/// `CREATE PROCEDURE` headers are usually real (legacy T-SQL quirks land whole bodies in ERROR).
+fn entering_error(node: Node, in_error: bool) -> bool {
+    in_error || node.is_error()
+}
+
+// ---- T-SQL --------------------------------------------------------------------
+
+/// Common T-SQL builtins whose query-embedded calls would flood the graph as unresolved noise.
+const TSQL_BUILTINS: &[&str] = &[
+    "abs", "avg", "cast", "ceiling", "charindex", "coalesce", "concat", "convert", "count",
+    "dateadd", "datediff", "datename", "datepart", "day", "dense_rank", "error_message",
+    "error_number", "floor", "format", "getdate", "getutcdate", "iif", "isnull", "isnumeric",
+    "lag", "lead", "left", "len", "lower", "ltrim", "max", "min", "month", "newid", "ntile",
+    "nullif", "object_id", "patindex", "rank", "replace", "right", "round", "row_number",
+    "rtrim", "scope_identity", "stuff", "string_agg", "string_split", "substring", "sum",
+    "sysdatetime", "sysutcdatetime", "try_cast", "try_convert", "upper", "year",
+];
+
+/// `GO` batch separators live on their own line (sqlcmd rule: optionally `GO <count>`) but the
+/// grammar mis-parses them — rewrite each such line to `;` so the grammar sees a plain statement
+/// boundary. Line-wise rewrite, so every extracted line number stays exact.
+fn strip_go_lines(src: &str) -> String {
+    src.lines()
+        .map(|line| {
+            let t = line.trim();
+            let is_go = t.eq_ignore_ascii_case("go")
+                || (t.len() > 2
+                    && t.is_char_boundary(2)
+                    && t[..2].eq_ignore_ascii_case("go")
+                    && t[2..].starts_with(char::is_whitespace)
+                    && t[2..].trim().chars().all(|c| c.is_ascii_digit()));
+            if is_go {
+                ";"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn parse_tsql(src: &str) -> anyhow::Result<ParsedFile> {
+    let pre = strip_go_lines(src);
+    let tree = tree_for(&pre, tree_sitter_sequel_tsql::LANGUAGE.into(), "tsql")?;
+    let mut out = ParsedFile::default();
+    walk_tsql(tree.root_node(), pre.as_bytes(), &mut out, "<module>", false);
+    out.symbolless_ok = !tree.root_node().has_error();
+    Ok(out)
+}
+
+/// (schema, name) from a tsql `object_reference` (fields: database/schema/name).
+fn obj_ref_parts<'a>(node: Node, src: &'a [u8]) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        node.child_by_field_name("schema").map(|n| text(n, src)),
+        node.child_by_field_name("name").map(|n| text(n, src)),
+    )
+}
+
+fn walk_tsql(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, in_error: bool) {
+    let in_error = entering_error(node, in_error);
+    let mut def_name: Option<String> = None;
+    match node.kind() {
+        "create_procedure" | "create_function" | "alter_procedure" | "alter_function" => {
+            if let Some(or) = find_child(node, "object_reference") {
+                let (schema, name) = obj_ref_parts(or, src);
+                if let Some(nm) = name {
+                    let d = mk_def(nm, "function", schema, node, src);
+                    def_name = Some(d.name.clone());
+                    out.defs.push(d);
+                }
+            }
+        }
+        // `CREATE TRIGGER name ON table ...` — the FIRST object_reference is the trigger's name.
+        "create_trigger" => {
+            if let Some(or) = find_child(node, "object_reference") {
+                let (schema, name) = obj_ref_parts(or, src);
+                if let Some(nm) = name {
+                    let d = mk_def(nm, "function", schema, node, src);
+                    def_name = Some(d.name.clone());
+                    out.defs.push(d);
+                }
+            }
+        }
+        // `foo(...)` in any expression, and `EXEC [dbo.]proc` — schema-qualified -> method kind.
+        "invocation" | "execute_statement" if !in_error => {
+            if let Some(or) = find_child(node, "object_reference") {
+                let (schema, name) = obj_ref_parts(or, src);
+                if let Some(nm) = name {
+                    let kind = if schema.is_some() { "method" } else { "func" };
+                    push_call(out, TSQL_BUILTINS, nm, kind, node.start_position().row + 1, enclosing);
+                }
+            }
+        }
+        _ => {}
+    }
+    let enc = def_name.as_deref().unwrap_or(enclosing);
+    walk_children(node, |c| walk_tsql(c, src, out, enc, in_error));
+}
+
+// ---- Oracle PL/SQL --------------------------------------------------------------
+
+/// Common Oracle builtins — same rationale as `TSQL_BUILTINS`. (`sysdate` is a bare identifier,
+/// not a call, so it never reaches extraction.)
+const PLSQL_BUILTINS: &[&str] = &[
+    "abs", "add_months", "ascii", "avg", "cast", "ceil", "chr", "coalesce", "count", "decode",
+    "dense_rank", "extract", "floor", "greatest", "initcap", "instr", "lag", "last_day", "lead",
+    "least", "length", "listagg", "lower", "lpad", "ltrim", "max", "min", "mod",
+    "bfilename", "empty_blob", "empty_clob", "hextoraw", "numtodsinterval", "numtoyminterval",
+    "ora_hash", "rawtohex", "sys_connect_by_path", "to_dsinterval", "to_timestamp",
+    "to_yminterval", "unistr", "xmltype",
+    // Oracle-shipped object-type constructors (spatial) — ubiquitous in data dumps
+    "sdo_elem_info_array", "sdo_geometry", "sdo_ordinate_array", "sdo_point_type",
+    "months_between", "next_day", "nullif", "nvl", "nvl2", "power", "rank", "regexp_instr",
+    "regexp_like", "regexp_replace", "regexp_substr", "replace", "round", "row_number", "rpad",
+    "rtrim", "sign", "sqrt", "substr", "sum", "to_char", "to_date", "to_number", "trim", "trunc",
+    "upper",
+];
+
+/// SQL*Plus client directives are line-oriented and not PL/SQL — the grammar doesn't know them,
+/// and a run of `rem` prose lines produces an ERROR region big enough to swallow the following
+/// `CREATE PROCEDURE` whole (seen in Oracle's own sample schemas). Blank those lines
+/// (line-preserving, like the T-SQL `GO` rewrite). `set` needs care: `UPDATE ...\nSET col = 1`
+/// puts SET at line start in real SQL, so it's blanked only for a known SQL*Plus parameter name
+/// with no `=` after it.
+fn strip_sqlplus_lines(src: &str) -> String {
+    const DIRECTIVES: &[&str] =
+        &["rem", "remark", "prompt", "spool", "show", "whenever", "define", "undefine"];
+    const SET_PARAMS: &[&str] = &[
+        "autocommit", "colsep", "echo", "feedback", "heading", "linesize", "long",
+        "longchunksize", "newpage", "numwidth", "pagesize", "pause", "serveroutput",
+        "sqlblanklines", "tab", "termout", "timing", "trimout", "trimspool", "verify", "wrap",
+    ];
+    src.lines()
+        .map(|line| {
+            let t = line.trim_start();
+            let mut words = t.split_whitespace();
+            let first = words.next().unwrap_or("").to_lowercase();
+            let second = words.next().unwrap_or("").to_lowercase();
+            let third = words.next().unwrap_or("");
+            let is_directive = t.starts_with('@')
+                || DIRECTIVES.contains(&first.as_str())
+                || (first == "set" && SET_PARAMS.contains(&second.as_str()) && !third.starts_with('='));
+            if is_directive {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn parse_plsql(src: &str) -> anyhow::Result<ParsedFile> {
+    let pre = strip_sqlplus_lines(src);
+    let tree = tree_for(&pre, tree_sitter_plsql::language(), "plsql")?;
+    let mut out = ParsedFile::default();
+    walk_plsql(tree.root_node(), pre.as_bytes(), &mut out, "<module>", None, false);
+    out.symbolless_ok = !tree.root_node().has_error();
+    Ok(out)
+}
+
+fn walk_plsql(
+    node: Node,
+    src: &[u8],
+    out: &mut ParsedFile,
+    enclosing: &str,
+    package: Option<&str>,
+    in_error: bool,
+) {
+    let in_error = entering_error(node, in_error);
+    let mut def_name: Option<String> = None;
+    let mut child_package = package;
+    match node.kind() {
+        // package spec AND body are both real `class`-container definitions; their members differ
+        // below (spec members are declarations -> no defs; body members are definitions -> defs).
+        "create_package" | "create_package_body" => {
+            if let Some(nm) = node.child_by_field_name("package_name") {
+                let d = mk_def(text(nm, src), "class", None, node, src);
+                def_name = Some(d.name.clone());
+                out.defs.push(d);
+            }
+        }
+        // object types are class containers too — `cust_address_typ(...)` ctor calls then resolve
+        // to the type. Only the SPEC emits the class def (attributes live there); the BODY just
+        // implements members, and a second same-name def would turn every ctor call ambiguous.
+        // (Packages differ: spec AND body both emit — nothing ever "calls" a package name, so the
+        // duplicate is harmless there and both containers are real.)
+        "create_type" => {
+            if let Some(nm) = find_child(node, "plsql_type_source").and_then(|ts| find_child(ts, "identifier")) {
+                let d = mk_def(text(nm, src), "class", None, node, src);
+                def_name = Some(d.name.clone());
+                out.defs.push(d);
+            }
+        }
+        // container only — member definitions inside carry the type as parent, no class def
+        "create_type_body" => {
+            if let Some(nm) = node.child_by_field_name("type_name") {
+                def_name = Some(norm(text(nm, src)));
+            }
+        }
+        // standalone `CREATE [OR REPLACE] PROCEDURE/FUNCTION [schema.]name`
+        "create_procedure" | "create_function" => {
+            let field = if node.kind() == "create_procedure" { "prc_name" } else { "fnc_name" };
+            if let Some(nm) = node.child_by_field_name(field) {
+                let schema = node.child_by_field_name("schema_name").map(|s| text(s, src));
+                let d = mk_def(text(nm, src), "function", schema, node, src);
+                def_name = Some(d.name.clone());
+                out.defs.push(d);
+            }
+        }
+        // members inside a package BODY (or nested in another definition — then parent is None,
+        // same rule as nested fns in every other language)
+        "procedure_definition" | "function_definition" => {
+            let field = if node.kind() == "procedure_definition" { "prc_name" } else { "fnc_name" };
+            if let Some(nm) = node.child_by_field_name(field) {
+                let d = mk_def(text(nm, src), "function", package, node, src);
+                def_name = Some(d.name.clone());
+                out.defs.push(d);
+            }
+            child_package = None;
+        }
+        "create_trigger" => {
+            if let Some(nm) = node.child_by_field_name("trigger_name") {
+                let schema = node.child_by_field_name("schema_name").map(|s| text(s, src));
+                let d = mk_def(text(nm, src), "function", schema, node, src);
+                def_name = Some(d.name.clone());
+                out.defs.push(d);
+            }
+        }
+        // `name(...)` anywhere — qualified (`pkg.proc`, `schema.pkg.proc`) -> method kind on the
+        // member name. PL/SQL can't syntactically split collection indexing from calls, so
+        // `arr(i)` is extracted too — honest over-report, resolves unresolved.
+        "ref_call" if !in_error => {
+            if let Some(re) = find_child(node, "referenced_element") {
+                if let Some(nm) = re.child_by_field_name("ref_name") {
+                    let qualified = re.child_by_field_name("ref_name_parent").is_some()
+                        || re.child_by_field_name("schema_name").is_some();
+                    let kind = if qualified { "method" } else { "func" };
+                    push_call(out, PLSQL_BUILTINS, text(nm, src), kind, node.start_position().row + 1, enclosing);
+                }
+            }
+        }
+        _ => {}
+    }
+    let enc = def_name.as_deref().unwrap_or(enclosing);
+    let container = matches!(
+        node.kind(),
+        "create_package" | "create_package_body" | "create_type" | "create_type_body"
+    );
+    let pkg = if def_name.is_some() && container { def_name.as_deref() } else { child_package };
+    walk_children(node, |c| walk_plsql(c, src, out, enc, pkg, in_error));
+}
+
+// ---- PostgreSQL -----------------------------------------------------------------
+
+/// Common pg builtins — same rationale as `TSQL_BUILTINS`.
+const PG_BUILTINS: &[&str] = &[
+    "abs", "age", "array_agg", "avg", "ceil", "ceiling", "char_length", "clock_timestamp",
+    "coalesce", "concat", "concat_ws", "count", "currval", "date_part", "date_trunc",
+    "dense_rank", "extract", "first_value", "floor", "format", "gen_random_uuid",
+    "generate_series", "greatest", "jsonb_agg", "jsonb_build_object", "json_agg",
+    "json_build_object", "lag", "last_value", "lastval", "lead", "least", "left", "length",
+    "lower", "lpad", "ltrim", "max", "md5", "min", "mod", "nextval", "now", "nullif", "position",
+    "power", "random", "rank", "regexp_match", "regexp_matches", "regexp_replace", "replace",
+    "right", "round", "row_number", "rpad", "rtrim", "setval", "split_part", "sqrt",
+    "statement_timestamp", "string_agg", "substr", "substring", "sum", "to_char", "to_date",
+    "to_number", "to_timestamp", "trim", "unnest", "upper",
+];
+
+pub fn parse_postgres(src: &str) -> anyhow::Result<ParsedFile> {
+    let tree = tree_for(src, tree_sitter_postgres::LANGUAGE.into(), "postgres")?;
+    let mut out = ParsedFile::default();
+    let mut ps = PgParsers::new()?;
+    walk_pg(tree.root_node(), src.as_bytes(), &mut out, "<module>", &mut ps, false);
+    out.symbolless_ok = !tree.root_node().has_error();
+    Ok(out)
+}
+
+/// One parser per grammar per file, reused across every body/fragment re-parse.
+struct PgParsers {
+    pl: Parser,
+    sql: Parser,
+}
+
+impl PgParsers {
+    fn new() -> anyhow::Result<Self> {
+        let mut pl = Parser::new();
+        pl.set_language(&tree_sitter_postgres::LANGUAGE_PLPGSQL.into())
+            .map_err(|e| anyhow::anyhow!("load plpgsql grammar: {e}"))?;
+        let mut sql = Parser::new();
+        sql.set_language(&tree_sitter_postgres::LANGUAGE.into())
+            .map_err(|e| anyhow::anyhow!("load postgres grammar: {e}"))?;
+        Ok(Self { pl, sql })
+    }
+}
+
+/// `analytics.compute` -> ["analytics", "compute"] — the grammar's func_name text, split on dots.
+/// `norm` (in the caller) strips quoting per part.
+fn dotted_parts(s: &str) -> Vec<&str> {
+    s.split('.').map(str::trim).filter(|p| !p.is_empty()).collect()
+}
+
+fn walk_pg(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &mut PgParsers, in_error: bool) {
+    let in_error = entering_error(node, in_error);
+    let mut def_name: Option<String> = None;
+    match node.kind() {
+        // covers CREATE FUNCTION and CREATE PROCEDURE (one grammar rule for both)
+        "CreateFunctionStmt" => {
+            if let Some(fname) = find_descendant(node, "func_name") {
+                let full = text(fname, src);
+                let parts = dotted_parts(full);
+                if let Some(nm) = parts.last() {
+                    let schema = (parts.len() > 1).then(|| parts[parts.len() - 2]);
+                    let d = mk_def(nm, "function", schema, node, src);
+                    def_name = Some(d.name.clone());
+                    out.defs.push(d);
+                }
+            }
+            if let Some(enc) = def_name.as_deref() {
+                pg_function_body(node, src, out, enc, ps);
+            }
+        }
+        // `DO $$ ... $$` — anonymous plpgsql block, calls attributed to <module>
+        "DoStmt" => {
+            if let Some(body) = find_descendant(node, "dollar_quoted_string") {
+                pg_plpgsql_body(body, src, out, enclosing, ps);
+            }
+        }
+        // plain SQL calls in the outer file (SELECT setup(); triggers' EXECUTE FUNCTION; defaults)
+        "func_application" if !in_error => {
+            if let Some(fname) = find_child(node, "func_name") {
+                pg_push_func(out, text(fname, src), node.start_position().row + 1, enclosing);
+            }
+        }
+        _ => {}
+    }
+    let enc = def_name.as_deref().unwrap_or(enclosing);
+    walk_children(node, |c| walk_pg(c, src, out, enc, ps, in_error));
+}
+
+fn pg_push_func(out: &mut ParsedFile, full: &str, line: usize, enclosing: &str) {
+    let parts = dotted_parts(full);
+    if let Some(nm) = parts.last() {
+        let kind = if parts.len() > 1 { "method" } else { "func" };
+        push_call(out, PG_BUILTINS, nm, kind, line, enclosing);
+    }
+}
+
+/// first descendant of `kind` (breadth-limited manual DFS; grammar guarantees shallow placement)
+fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == kind {
+            return Some(n);
+        }
+        let mut c = n.walk();
+        for child in n.named_children(&mut c) {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+/// A CreateFunctionStmt's body is a string literal — find `LANGUAGE x` and the dollar-quoted body,
+/// then re-parse: plpgsql via the bundled plpgsql grammar, `LANGUAGE sql` directly as statements.
+/// Single-quoted bodies stay defs-only (escape soup; dollar quoting is the norm).
+fn pg_function_body(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &mut PgParsers) {
+    let mut language: Option<String> = None;
+    let mut body: Option<Node> = None;
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "createfunc_opt_item" {
+            if find_child(n, "kw_language").is_some() {
+                if let Some(v) = n.named_child(n.named_child_count().saturating_sub(1)) {
+                    language = Some(text(v, src).to_lowercase());
+                }
+            } else if let Some(b) = find_descendant(n, "dollar_quoted_string") {
+                body = Some(b);
+            }
+            continue;
+        }
+        let mut c = n.walk();
+        for child in n.named_children(&mut c) {
+            stack.push(child);
+        }
+    }
+    match (language.as_deref(), body) {
+        (Some("plpgsql"), Some(b)) => pg_plpgsql_body(b, src, out, enclosing, ps),
+        (Some("sql"), Some(b)) => {
+            if let Some(blanked) = blank_dollar_delims(text(b, src)) {
+                pg_sql_fragment(&blanked, b.start_position().row, out, enclosing, ps);
+            }
+        }
+        _ => {} // no body string (BEGIN ATOMIC parses inline via the generic walk), C functions, etc.
+    }
+}
+
+/// Replace the `$tag$` delimiters with equal-length spaces so the inner text keeps its exact rows
+/// (tags never contain newlines), then hand back the row-preserving body.
+fn blank_dollar_delims(raw: &str) -> Option<String> {
+    if !raw.starts_with('$') {
+        return None;
+    }
+    let close = raw[1..].find('$')? + 1;
+    let tag_len = close + 1;
+    if raw.len() < tag_len * 2 || !raw.ends_with(&raw[..tag_len]) {
+        return None;
+    }
+    let mut s = String::with_capacity(raw.len());
+    s.push_str(&" ".repeat(tag_len));
+    s.push_str(&raw[tag_len..raw.len() - tag_len]);
+    s.push_str(&" ".repeat(tag_len));
+    Some(s)
+}
+
+/// Parse a dollar-quoted plpgsql body with the bundled plpgsql grammar (row-preserving blank of the
+/// delimiters, so `body_row + inner_row` is the absolute row). The plpgsql grammar keeps embedded
+/// SQL as opaque `sql_expression` leaves — each one re-parses through `pg_sql_fragment`.
+fn pg_plpgsql_body(body: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &mut PgParsers) {
+    let Some(blanked) = blank_dollar_delims(text(body, src)) else { return };
+    let Some(tree) = ps.pl.parse(&blanked, None) else { return };
+    let base = body.start_position().row;
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "sql_expression" {
+            pg_sql_fragment(text(n, blanked.as_bytes()), base + n.start_position().row, out, enclosing, ps);
+            continue;
+        }
+        let mut c = n.walk();
+        for child in n.named_children(&mut c) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Extract calls from one SQL fragment: parse as statement text first (covers plpgsql
+/// `stmt_execsql` bodies like `SELECT ... INTO ...`), else wrapped as `SELECT <expr>;` (covers
+/// PERFORM/CALL/IF/assignment expressions — the prefix adds no rows, and rows are all we record).
+/// Fragments that parse neither way are skipped: no call-site is invented (never guess).
+fn pg_sql_fragment(fragment: &str, base_row: usize, out: &mut ParsedFile, enclosing: &str, ps: &mut PgParsers) {
+    if fragment.trim().is_empty() {
+        return;
+    }
+    let direct = ps.sql.parse(fragment, None).filter(|t| !t.root_node().has_error());
+    let (tree, text_owned): (Tree, String) = match direct {
+        Some(t) => (t, fragment.to_string()),
+        None => {
+            let wrapped = format!("SELECT {fragment};");
+            match ps.sql.parse(&wrapped, None).filter(|t| !t.root_node().has_error()) {
+                Some(t) => (t, wrapped),
+                None => return,
+            }
+        }
+    };
+    let src = text_owned.as_bytes();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "func_application" {
+            if let Some(fname) = find_child(n, "func_name") {
+                pg_push_func(out, text(fname, src), base_row + n.start_position().row + 1, enclosing);
+            }
+        }
+        let mut c = n.walk();
+        for child in n.named_children(&mut c) {
+            stack.push(child);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- T-SQL ----
+
+    #[test]
+    fn tsql_defs_calls_and_go() {
+        let src = "\
+CREATE PROCEDURE dbo.UpdateStats
+AS
+BEGIN
+    SELECT COUNT(1), SUM(Amount) FROM Orders;
+    EXEC dbo.LogAccess 1;
+    EXEC UpdateHelper;
+    SELECT dbo.OrderTotal(2);
+END
+GO
+CREATE FUNCTION dbo.OrderTotal (@OrderId INT) RETURNS INT
+AS
+BEGIN
+    RETURN 1
+END
+GO 2
+";
+        let p = parse_tsql(src).unwrap();
+        // defs: lowercased, schema as parent, correct lines
+        let d = p.defs.iter().find(|d| d.name == "updatestats").unwrap();
+        assert_eq!(d.parent_class.as_deref(), Some("dbo"));
+        assert_eq!(d.start_line, 1);
+        assert!(p.defs.iter().any(|d| d.name == "ordertotal" && d.start_line == 10));
+        // qualified EXEC -> method; bare EXEC -> func; invocation in SELECT -> method (dbo-qualified)
+        assert!(p.calls.iter().any(|c| c.name == "logaccess" && c.kind == "method" && c.enclosing == "updatestats" && c.line == 5));
+        assert!(p.calls.iter().any(|c| c.name == "updatehelper" && c.kind == "func"));
+        assert!(p.calls.iter().any(|c| c.name == "ordertotal" && c.kind == "method" && c.line == 7));
+        // builtins skipped
+        assert!(!p.calls.iter().any(|c| c.name == "count" || c.name == "sum"));
+        assert!(p.symbolless_ok, "GO-stripped source parses clean");
+    }
+
+    #[test]
+    fn tsql_ddl_only_is_symbolless_ok() {
+        let p = parse_tsql("CREATE TABLE t (id INT PRIMARY KEY);\n").unwrap();
+        assert!(p.defs.is_empty() && p.calls.is_empty());
+        assert!(p.symbolless_ok);
+    }
+
+    // ---- PL/SQL ----
+
+    #[test]
+    fn plsql_package_spec_body_and_standalone() {
+        let src = "\
+CREATE OR REPLACE PACKAGE order_pkg AS
+  PROCEDURE process_order(p_id IN NUMBER);
+END order_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY order_pkg AS
+  PROCEDURE process_order(p_id IN NUMBER) IS
+    v_total NUMBER;
+  BEGIN
+    v_total := ORDER_TOTAL(p_id);
+    log_pkg.write('processed');
+    audit_order(p_id, v_total);
+  END process_order;
+END order_pkg;
+/
+
+CREATE OR REPLACE PROCEDURE audit_order(p_id NUMBER, p_total NUMBER) IS
+BEGIN
+  INSERT INTO audit_log VALUES (p_id, p_total, SYSDATE);
+END;
+/
+";
+        let p = parse_plsql(src).unwrap();
+        // package spec + body are class containers; spec's PROCEDURE decl emits NO def
+        assert_eq!(p.defs.iter().filter(|d| d.name == "order_pkg" && d.kind == "class").count(), 2);
+        let members: Vec<_> = p.defs.iter().filter(|d| d.name == "process_order").collect();
+        assert_eq!(members.len(), 1, "spec decl is not a def; only the body definition is");
+        assert_eq!(members[0].parent_class.as_deref(), Some("order_pkg"));
+        // standalone proc
+        assert!(p.defs.iter().any(|d| d.name == "audit_order" && d.parent_class.is_none()));
+        // calls: case-folded bare call -> func; pkg-qualified -> method
+        assert!(p.calls.iter().any(|c| c.name == "order_total" && c.kind == "func" && c.enclosing == "process_order"));
+        assert!(p.calls.iter().any(|c| c.name == "write" && c.kind == "method" && c.enclosing == "process_order"));
+        assert!(p.calls.iter().any(|c| c.name == "audit_order" && c.kind == "func"));
+        assert!(p.symbolless_ok);
+    }
+
+    /// SQL*Plus directive runs must not swallow the following CREATE (Oracle sample-schema shape);
+    /// real `UPDATE ... SET` lines survive the `set` blanking.
+    #[test]
+    fn plsql_sqlplus_directives_stripped() {
+        let src = "\
+SET ECHO OFF
+SET NUMWIDTH 10
+REM **************************************
+REM procedure to allow dmls during business hours
+REM another prose line that goes on and on
+CREATE OR REPLACE PROCEDURE secure_dml
+IS
+BEGIN
+  UPDATE employees
+  SET salary = 1
+  WHERE id = 5;
+END secure_dml;
+/
+";
+        let p = parse_plsql(src).unwrap();
+        assert!(p.defs.iter().any(|d| d.name == "secure_dml" && d.start_line == 6), "{:?}", p.defs);
+        // the UPDATE's SET line survived blanking (statement intact -> no parse error)
+        assert!(p.symbolless_ok, "directives blanked, rest parses clean");
+    }
+
+    // ---- PostgreSQL ----
+
+    #[test]
+    fn pg_plpgsql_body_calls_with_correct_lines() {
+        let src = "\
+CREATE OR REPLACE FUNCTION order_total(oid int) RETURNS numeric AS $$
+DECLARE
+  t numeric;
+BEGIN
+  SELECT sum(amount) INTO t FROM order_lines WHERE order_id = oid;
+  PERFORM log_access(oid);
+  IF t IS NULL THEN
+    t := default_total();
+  END IF;
+  CALL analytics.rebuild(oid);
+  RETURN t;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION plain_sql(x int) RETURNS int AS $$ SELECT order_total(x) $$ LANGUAGE sql;
+";
+        let p = parse_postgres(src).unwrap();
+        assert!(p.defs.iter().any(|d| d.name == "order_total" && d.kind == "function" && d.start_line == 1));
+        assert!(p.defs.iter().any(|d| d.name == "plain_sql" && d.start_line == 15));
+        // body calls with absolute lines: PERFORM on 6, assignment RHS on 8, qualified CALL on 10
+        assert!(p.calls.iter().any(|c| c.name == "log_access" && c.kind == "func" && c.enclosing == "order_total" && c.line == 6));
+        assert!(p.calls.iter().any(|c| c.name == "default_total" && c.line == 8));
+        assert!(p.calls.iter().any(|c| c.name == "rebuild" && c.kind == "method" && c.line == 10));
+        // LANGUAGE sql body parses directly
+        assert!(p.calls.iter().any(|c| c.name == "order_total" && c.enclosing == "plain_sql" && c.line == 15));
+        // builtins skipped
+        assert!(!p.calls.iter().any(|c| c.name == "sum"));
+        assert!(p.symbolless_ok);
+    }
+
+    #[test]
+    fn pg_schema_qualified_def_and_module_call() {
+        let src = "\
+CREATE FUNCTION analytics.rollup(day date) RETURNS void AS $$
+BEGIN
+  PERFORM analytics.compute(day);
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT setup_all();
+";
+        let p = parse_postgres(src).unwrap();
+        let d = p.defs.iter().find(|d| d.name == "rollup").unwrap();
+        assert_eq!(d.parent_class.as_deref(), Some("analytics"));
+        assert!(p.calls.iter().any(|c| c.name == "compute" && c.kind == "method" && c.enclosing == "rollup"));
+        assert!(p.calls.iter().any(|c| c.name == "setup_all" && c.enclosing == "<module>" && c.line == 7));
+    }
+
+    #[test]
+    fn pg_ddl_only_is_symbolless_ok() {
+        let p = parse_postgres("CREATE TABLE t (id int primary key);\n").unwrap();
+        assert!(p.defs.is_empty() && p.calls.is_empty());
+        assert!(p.symbolless_ok);
+    }
+
+    #[test]
+    fn blank_dollar_delims_preserves_rows() {
+        let body = "$fn$\nBEGIN\nEND;\n$fn$";
+        let blanked = blank_dollar_delims(body).unwrap();
+        assert_eq!(blanked.len(), body.len());
+        assert_eq!(blanked.lines().count(), body.lines().count());
+        assert!(blanked.starts_with("    \n"));
+        assert!(blank_dollar_delims("'not dollar'").is_none());
+    }
+}

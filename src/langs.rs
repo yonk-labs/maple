@@ -8,7 +8,7 @@
 use crate::parser::{first_line, text, Alias, CallSite, Definition, Import, ImportName, ParsedFile};
 use tree_sitter::{Language, Node, Parser, Tree};
 
-fn tree_for(src: &str, language: Language, what: &str) -> anyhow::Result<Tree> {
+pub(crate) fn tree_for(src: &str, language: Language, what: &str) -> anyhow::Result<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&language).map_err(|e| anyhow::anyhow!("load {what} grammar: {e}"))?;
     parser.parse(src, None).ok_or_else(|| anyhow::anyhow!("tree-sitter returned no tree"))
@@ -98,14 +98,14 @@ fn last_segment(path: &str, sep: &str) -> String {
     path.rsplit(sep).next().unwrap_or(path).trim().to_string()
 }
 
-fn walk_children<F: FnMut(Node)>(node: Node, mut f: F) {
+pub(crate) fn walk_children<F: FnMut(Node)>(node: Node, mut f: F) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         f(child);
     }
 }
 
-fn find_child<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+pub(crate) fn find_child<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
     let mut found = None;
     for c in node.named_children(&mut cursor) {

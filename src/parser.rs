@@ -37,18 +37,78 @@ pub static LANGS: &[LangSpec] = &[
     LangSpec { name: "go", extensions: &["go"], parse: crate::langs::parse_go },
 ];
 
-pub fn lang_for_path(path: &Path) -> Option<&'static LangSpec> {
+/// L2.1 — SQL dialect for `.sql` files. All three dialects share the extension and sniffing would
+/// guess, so `.sql` maps to a language only when a dialect is configured (`maple index
+/// --sql-dialect=...`, persisted in the store's meta table — refresh/queries inherit it). The
+/// Oracle-only extensions in `ORACLE_EXTS` always mean PL/SQL, no setting needed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SqlDialect {
+    Postgres,
+    Tsql,
+    Plsql,
+}
+
+pub const ORACLE_EXTS: &[&str] = &["pks", "pkb", "prc", "fnc", "trg", "pls"];
+
+static SQL_POSTGRES: LangSpec =
+    LangSpec { name: "sql-postgres", extensions: &["sql"], parse: crate::langs_sql::parse_postgres };
+static SQL_TSQL: LangSpec =
+    LangSpec { name: "sql-tsql", extensions: &["sql"], parse: crate::langs_sql::parse_tsql };
+static SQL_PLSQL: LangSpec = LangSpec {
+    name: "sql-plsql",
+    extensions: &["sql", "pks", "pkb", "prc", "fnc", "trg", "pls"],
+    parse: crate::langs_sql::parse_plsql,
+};
+
+impl SqlDialect {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "postgres" => Ok(Self::Postgres),
+            "tsql" => Ok(Self::Tsql),
+            "plsql" => Ok(Self::Plsql),
+            _ => anyhow::bail!("unknown --sql-dialect {s:?} (expected postgres, tsql, or plsql)"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Tsql => "tsql",
+            Self::Plsql => "plsql",
+        }
+    }
+
+    fn spec(self) -> &'static LangSpec {
+        match self {
+            Self::Postgres => &SQL_POSTGRES,
+            Self::Tsql => &SQL_TSQL,
+            Self::Plsql => &SQL_PLSQL,
+        }
+    }
+}
+
+pub fn lang_for_path(path: &Path, sql: Option<SqlDialect>) -> Option<&'static LangSpec> {
     let ext = path.extension()?.to_str()?;
+    if ORACLE_EXTS.contains(&ext) {
+        return Some(&SQL_PLSQL);
+    }
+    if ext == "sql" {
+        return sql.map(SqlDialect::spec);
+    }
     LANGS.iter().find(|l| l.extensions.contains(&ext))
 }
 
+/// Display-side check (fq-name extension stripping, `--module` addressing): SQL extensions count
+/// regardless of whether a dialect is configured — an indexed `.sql` file's fq name must strip.
 pub fn is_registered_ext(ext: &str) -> bool {
-    LANGS.iter().any(|l| l.extensions.contains(&ext))
+    ext == "sql" || ORACLE_EXTS.contains(&ext) || LANGS.iter().any(|l| l.extensions.contains(&ext))
 }
 
 /// ".py .rs .c ..." — for the `maple parse` unsupported-language error.
 pub fn supported_extensions_list() -> String {
-    LANGS.iter().flat_map(|l| l.extensions).map(|e| format!(".{e}")).collect::<Vec<_>>().join(" ")
+    let base = LANGS.iter().flat_map(|l| l.extensions).map(|e| format!(".{e}")).collect::<Vec<_>>().join(" ");
+    let oracle = ORACLE_EXTS.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(" ");
+    format!("{base} {oracle} .sql(with --sql-dialect)")
 }
 
 #[derive(Serialize, Debug)]
@@ -106,6 +166,11 @@ pub struct ParsedFile {
     pub imports: Vec<Import>,
     pub aliases: Vec<Alias>,
     pub import_names: Vec<ImportName>,
+    /// L2 — set by the SQL walks when the tree parsed without errors: a `.sql` file with zero
+    /// defs/calls (a DDL-only migration) is legitimately symbolless, not "suspect". Internal flag
+    /// for the store's suspect check, never serialized.
+    #[serde(skip)]
+    pub symbolless_ok: bool,
 }
 
 /// walk context: enclosing fn (call attribution), method_class (set only for the immediate class

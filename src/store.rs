@@ -113,9 +113,9 @@ struct FileParse {
 
 /// T13 — read + parse `path` (relative name `rel`); pure CPU work, safe to run on a rayon thread.
 /// L1.1: the walk is dispatched by extension via the registry — `path` is only ever a file the
-/// registered-extension walker yielded.
-fn parse_one_file(path: &Path, rel: String) -> FileParse {
-    let lang = crate::parser::lang_for_path(path).expect("walker only yields registered extensions");
+/// registered-extension walker yielded. L2.1: `.sql` dispatch needs the store's dialect.
+fn parse_one_file(path: &Path, rel: String, sql: Option<crate::parser::SqlDialect>) -> FileParse {
+    let lang = crate::parser::lang_for_path(path, sql).expect("walker only yields registered extensions");
     let outcome = match std::fs::read(path) {
         Err(e) => ParseOutcome::Unreadable(format!("unreadable: {e}")),
         Ok(bytes) => {
@@ -127,11 +127,13 @@ fn parse_one_file(path: &Path, rel: String) -> FileParse {
                     // T15: tree-sitter is error-tolerant (rarely returns Err above) — a non-empty
                     // file that parses to zero defs+calls+imports is the actually-triggerable
                     // signal that something's wrong (garbage/binary content, or a source shape the
-                    // shallow walk doesn't extract anything from).
+                    // shallow walk doesn't extract anything from). L2: SQL walks vouch for
+                    // legitimately symbolless files (DDL-only) via `symbolless_ok`.
                     let suspect = parsed.defs.is_empty()
                         && parsed.calls.is_empty()
                         && parsed.imports.is_empty()
-                        && !src.trim().is_empty();
+                        && !src.trim().is_empty()
+                        && !parsed.symbolless_ok;
                     ParseOutcome::Ok { hash, parsed, suspect }
                 }
             }
@@ -409,6 +411,10 @@ pub struct Bundle {
 pub struct Store {
     pub conn: Connection,
     root: PathBuf,
+    /// L2.1 — the repo's configured `.sql` dialect (meta key `sql_dialect`, set by
+    /// `index --sql-dialect`). None -> `.sql` files are not indexed; Oracle-only extensions
+    /// (.pks/.pkb/...) are always PL/SQL regardless.
+    sql_dialect: Option<crate::parser::SqlDialect>,
 }
 
 impl Store {
@@ -452,7 +458,25 @@ impl Store {
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        Ok(Self { conn, root: repo_root.to_path_buf() })
+        // L2.1: the persisted `.sql` dialect (set by `index --sql-dialect`, survives via seed's db
+        // copy). An unrecognized stored value (db from a newer maple) degrades to None — `.sql`
+        // files are skipped rather than mis-parsed.
+        let sql_dialect = conn
+            .query_row("SELECT value FROM meta WHERE key='sql_dialect'", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .and_then(|v| crate::parser::SqlDialect::parse(&v).ok());
+        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect })
+    }
+
+    /// L2.1 — persist the repo's `.sql` dialect so refresh/queries (and seeded copies) inherit it.
+    pub fn set_sql_dialect(&mut self, d: crate::parser::SqlDialect) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('sql_dialect',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [d.as_str()],
+        )?;
+        self.sql_dialect = Some(d);
+        Ok(())
     }
 
     /// Cold full index: parse all registered-language files, persist symbols/imports, then resolve edges.
@@ -467,7 +491,8 @@ impl Store {
     /// back an uncommitted transaction on next open — instead of the old un-transacted `clear()`,
     /// which could wipe the graph and then be interrupted before the rebuild finished.
     pub fn index_repo(&mut self, root: &Path) -> Result<IndexStats> {
-        let files = source_files(root);
+        let sql = self.sql_dialect;
+        let files = source_files(root, sql);
         let mut st = IndexStats::default();
 
         // T13: parse (file read + tree-sitter, pure CPU) in parallel across files; every SQLite
@@ -477,7 +502,7 @@ impl Store {
             .par_iter()
             .map(|path| {
                 let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-                parse_one_file(path, rel)
+                parse_one_file(path, rel, sql)
             })
             .collect();
 
@@ -592,11 +617,7 @@ impl Store {
             // the git-aware O(changes) fast path immediately (skipped for non-git repos, or when
             // HEAD can't be read — e.g. a repo with zero commits yet).
             if let Some(head) = git_rev_parse_head(root) {
-                tx.execute(
-                    "INSERT INTO meta(key,value) VALUES('last_indexed_head',?1) \
-                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    [head],
-                )?;
+                record_git_state(&tx, root, &head)?;
             }
         }
         tx.commit()?;
@@ -885,6 +906,7 @@ impl Store {
     /// which is the "guaranteed-fresh at query time" contract. No daemon.
     pub fn refresh(&mut self) -> Result<RefreshStats> {
         let root = self.root.clone();
+        let sql = self.sql_dialect;
         let mut st = RefreshStats::default();
 
         // T12: git-aware O(changes) delta. When HEAD hasn't moved since the last index/refresh,
@@ -904,10 +926,25 @@ impl Store {
                     .optional()?;
                 if stored_head.as_deref() == Some(head.as_str()) {
                     if let Some(status) = git_status_porcelain(&root) {
+                        let mut cand = parse_porcelain_paths(&status);
+                        // T12 fix: a file that was DIRTY when the store last recorded this HEAD
+                        // may since have been reverted (git checkout/stash) — porcelain no longer
+                        // names it, but the store still holds its dirty-time contents. Union in
+                        // the recorded dirty set so those paths get hash-compared too.
+                        if let Some(prev) = self
+                            .conn
+                            .query_row("SELECT value FROM meta WHERE key='dirty_at_head'", [], |r| {
+                                r.get::<_, String>(0)
+                            })
+                            .optional()?
+                        {
+                            cand.extend(prev.lines().map(str::to_string));
+                        }
+                        cand.sort();
+                        cand.dedup();
                         candidate_paths = Some(
-                            parse_porcelain_paths(&status)
-                                .into_iter()
-                                .filter(|p| crate::parser::lang_for_path(Path::new(p)).is_some())
+                            cand.into_iter()
+                                .filter(|p| crate::parser::lang_for_path(Path::new(p), sql).is_some())
                                 .collect(),
                         );
                     }
@@ -946,7 +983,7 @@ impl Store {
             (changed, deleted)
         } else {
             // fallback: non-git repo, a git error, or HEAD moved — walk + hash everything.
-            for path in source_files(&root) {
+            for path in source_files(&root, sql) {
                 let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
                 match std::fs::read(&path) {
                     Ok(bytes) => {
@@ -964,11 +1001,7 @@ impl Store {
             // still record the observed HEAD (idempotent) so a HEAD-changed fallback run with a
             // genuinely empty diff still unlocks the fast path on the next call.
             if let Some(head) = &observed_head {
-                self.conn.execute(
-                    "INSERT INTO meta(key,value) VALUES('last_indexed_head',?1) \
-                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    [head],
-                )?;
+                record_git_state(&self.conn, &root, head)?;
             }
             return Ok(st);
         }
@@ -1007,8 +1040,8 @@ impl Store {
         let parsed_changed: Vec<(String, &'static str, ParseOutcome)> = changed
             .par_iter()
             .map(|f| {
-                let lang =
-                    crate::parser::lang_for_path(Path::new(f)).expect("changed set only holds registered files");
+                let lang = crate::parser::lang_for_path(Path::new(f), sql)
+                    .expect("changed set only holds registered files");
                 let (hash, bytes) = &disk[f];
                 let src = String::from_utf8_lossy(bytes);
                 let outcome = match (lang.parse)(&src) {
@@ -1017,7 +1050,8 @@ impl Store {
                         let suspect = parsed.defs.is_empty()
                             && parsed.calls.is_empty()
                             && parsed.imports.is_empty()
-                            && !src.trim().is_empty();
+                            && !src.trim().is_empty()
+                            && !parsed.symbolless_ok;
                         ParseOutcome::Ok { hash: hash.clone(), parsed, suspect }
                     }
                 };
@@ -1136,11 +1170,7 @@ impl Store {
         // T12: record the HEAD this refresh reflects, atomically with the rest of the update, so
         // the next call can trust the git-aware fast path from here.
         if let Some(head) = &observed_head {
-            tx.execute(
-                "INSERT INTO meta(key,value) VALUES('last_indexed_head',?1) \
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [head],
-            )?;
+            record_git_state(&tx, &root, head)?;
         }
         tx.commit()?;
         Ok(st)
@@ -1401,6 +1431,26 @@ pub fn seed(target: &Path, source: &Path, force: bool) -> Result<RefreshStats> {
 /// T12 — `git -C root rev-parse HEAD`; `None` on any error (bad/missing repo, zero commits yet, git
 /// not installed) — callers treat that as "can't trust git," falling back to the full hash walk
 /// (correctness first: when in doubt, walk).
+/// T12 — persist the git state the store now reflects: the HEAD, and the porcelain-dirty paths at
+/// this moment. The dirty set is what makes the fast path sound: a file that's dirty NOW can be
+/// reverted later (git checkout/stash), after which porcelain goes silent about it while the store
+/// still holds its dirty-time contents — the next refresh must hash-compare it anyway. Works on a
+/// `Transaction` too (derefs to `Connection`).
+fn record_git_state(conn: &Connection, root: &Path, head: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('last_indexed_head',?1) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [head],
+    )?;
+    let dirty = git_status_porcelain(root).map(|s| parse_porcelain_paths(&s).join("\n")).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('dirty_at_head',?1) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [dirty],
+    )?;
+    Ok(())
+}
+
 fn git_rev_parse_head(root: &Path) -> Option<String> {
     let out = std::process::Command::new("git").arg("-C").arg(root).arg("rev-parse").arg("HEAD").output().ok()?;
     if !out.status.success() {
@@ -1774,10 +1824,11 @@ fn hash_bytes(b: &[u8]) -> String {
 }
 
 /// L1.1 — every file under `root` (skip dirs excluded) whose extension is registered in
-/// `parser::LANGS`. The generalized `python_files` walker.
-fn source_files(root: &Path) -> Vec<PathBuf> {
+/// `parser::LANGS`. The generalized `python_files` walker. L2.1: `.sql` files are yielded only
+/// when the store has a configured dialect.
+fn source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    fn rec(dir: &Path, out: &mut Vec<PathBuf>) {
+    fn rec(dir: &Path, out: &mut Vec<PathBuf>, sql: Option<crate::parser::SqlDialect>) {
         let rd = match std::fs::read_dir(dir) {
             Ok(r) => r,
             Err(_) => return,
@@ -1787,14 +1838,14 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
             if p.is_dir() {
                 let name = e.file_name();
                 if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
-                    rec(&p, out);
+                    rec(&p, out, sql);
                 }
-            } else if crate::parser::lang_for_path(&p).is_some() {
+            } else if crate::parser::lang_for_path(&p, sql).is_some() {
                 out.push(p);
             }
         }
     }
-    rec(root, &mut out);
+    rec(root, &mut out, sql);
     out
 }
 
@@ -2964,6 +3015,42 @@ mod tests {
         assert_eq!(delta_proj, graph_projection(&s2), "git-aware delta == rebuild");
     }
 
+    /// T12 fix — index while a file is DIRTY, then `git checkout` it back to HEAD: porcelain goes
+    /// silent (working tree == HEAD, HEAD unmoved) while the store still holds the dirty-time
+    /// contents. The fast path must union in the dirty-at-index set and re-parse the reverted
+    /// file — before the fix this left the store permanently stale (A1 violation).
+    #[test]
+    fn t12_dirty_index_then_checkout_still_refreshes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("lib.py"), "def stable():\n    return 1\n").unwrap();
+        git(root, &["init"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "init"]);
+
+        // dirty the file, index the DIRTY state (records HEAD + the dirty set)
+        fs::write(root.join("lib.py"), "def renamed():\n    return 1\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(s.exists("renamed", false).unwrap().defs.len(), 1);
+
+        // revert to HEAD: porcelain is now empty, HEAD unchanged — the trap
+        git(root, &["checkout", "--", "lib.py"]);
+        let st = s.refresh().unwrap();
+        assert_eq!(st.changed, 1, "reverted file re-parsed via the recorded dirty set");
+        assert_eq!(s.exists("stable", false).unwrap().defs.len(), 1, "store reflects the restored content");
+        assert_eq!(s.exists("renamed", false).unwrap().defs.len(), 0);
+
+        // and the next refresh is a clean no-op (dirty set was rewritten to the now-empty porcelain)
+        let st2 = s.refresh().unwrap();
+        assert_eq!((st2.changed, st2.deleted), (0, 0));
+
+        let delta_proj = graph_projection(&s);
+        let mut s2 = Store::open(root).unwrap();
+        s2.index_repo(root).unwrap();
+        assert_eq!(delta_proj, graph_projection(&s2), "post-revert delta == rebuild");
+    }
+
     /// T12 — a commit between refreshes moves HEAD, and the edit that just got committed leaves
     /// `git status --porcelain` completely empty (working tree == new HEAD): trusting porcelain
     /// alone here would wrongly report "nothing changed" even though the store is still one commit
@@ -3355,5 +3442,202 @@ mod tests {
         let mut s2 = Store::open(root).unwrap();
         s2.index_repo(root).unwrap();
         assert_eq!(delta_proj, graph_projection(&s2), "mixed-language delta == rebuild");
+    }
+
+    // ---- L2.5 — SQL dialect fixtures --------------------------------------------------------
+
+    /// L2.5 T-SQL — `--sql-dialect=tsql`: cross-file EXEC resolves exact; schema-qualified call
+    /// lands kind `method`; case folds (`UPDATESTATS()` call -> `UpdateStats` def); builtins
+    /// (`COUNT`) emit no edge.
+    #[test]
+    fn l2_tsql_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("procs.sql"),
+            "CREATE PROCEDURE dbo.UpdateStats\nAS\nBEGIN\n    SELECT COUNT(1) FROM Orders;\nEND\nGO\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("callers.sql"),
+            "CREATE PROCEDURE Nightly\nAS\nBEGIN\n    EXEC dbo.UPDATESTATS;\n    EXEC missing_proc;\nEND\nGO\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(
+            resolved(&s, "updatestats", "nightly"),
+            ("exact".into(), Some("procs.sql".into())),
+            "cross-file EXEC, case-folded"
+        );
+        assert_eq!(edge_kinds(&s, "updatestats", "nightly").1, "method", "dbo-qualified -> method kind");
+        assert_eq!(resolved(&s, "missing_proc", "nightly").0, "unresolved");
+        assert_eq!(parent_of(&s, "updatestats").as_deref(), Some("dbo"), "schema recorded as parent");
+        let count_edges: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM edges WHERE callee_name='count'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_edges, 0, "builtin COUNT emits no edge");
+    }
+
+    /// L2.5 PostgreSQL — `--sql-dialect=postgres`: a plpgsql body's PERFORM resolves exact
+    /// cross-file; schema-qualified call in a body lands kind `method`; DDL-only file is neither
+    /// suspect nor a def source.
+    #[test]
+    fn l2_postgres_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("funcs.sql"),
+            "CREATE FUNCTION log_access(uid int) RETURNS void AS $$\nBEGIN\n  RETURN;\nEND;\n$$ LANGUAGE plpgsql;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("callers.sql"),
+            "CREATE FUNCTION order_total(oid int) RETURNS numeric AS $$\nBEGIN\n  PERFORM LOG_ACCESS(oid);\n  PERFORM analytics.compute(oid);\nEND;\n$$ LANGUAGE plpgsql;\n",
+        )
+        .unwrap();
+        fs::write(root.join("schema.sql"), "CREATE TABLE orders (id int primary key);\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(
+            resolved(&s, "log_access", "order_total"),
+            ("exact".into(), Some("funcs.sql".into())),
+            "plpgsql body call, case-folded, cross-file"
+        );
+        assert_eq!(edge_kinds(&s, "compute", "order_total"), ("unresolved".into(), "method".into()));
+        assert!(s.parse_failures().unwrap().is_empty(), "DDL-only schema.sql is not suspect");
+        let ddl_syms: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM symbols WHERE file='schema.sql'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ddl_syms, 0);
+    }
+
+    /// L2.5 Oracle — `.pks`/`.pkb` need NO dialect flag: the spec's decl emits no def, the body's
+    /// member carries the package as parent, a package-qualified call from another file lands kind
+    /// `method` and resolves exact.
+    #[test]
+    fn l2_plsql_package_fixture_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("order_pkg.pks"),
+            "CREATE OR REPLACE PACKAGE order_pkg AS\n  PROCEDURE process_order(p_id IN NUMBER);\nEND order_pkg;\n/\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("order_pkg.pkb"),
+            "CREATE OR REPLACE PACKAGE BODY order_pkg AS\n  PROCEDURE process_order(p_id IN NUMBER) IS\n  BEGIN\n    NULL;\n  END process_order;\nEND order_pkg;\n/\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("nightly.prc"),
+            "CREATE OR REPLACE PROCEDURE nightly IS\nBEGIN\n  order_pkg.process_order(1);\n  helper_only(2);\nEND;\n/\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        let member_defs: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols WHERE name='process_order'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(member_defs, 1, "spec decl emits no def; body definition does");
+        assert_eq!(parent_of(&s, "process_order").as_deref(), Some("order_pkg"));
+        assert_eq!(
+            resolved(&s, "process_order", "nightly"),
+            ("exact".into(), Some("order_pkg.pkb".into())),
+            "pkg-qualified call resolves to the body member"
+        );
+        assert_eq!(edge_kinds(&s, "process_order", "nightly").1, "method");
+        assert_eq!(resolved(&s, "helper_only", "nightly").0, "unresolved");
+    }
+
+    /// L2.1 — no dialect set: `.sql` files are not indexed at all (no defs, no suspect noise), and
+    /// Oracle-only extensions still are.
+    #[test]
+    fn l2_unset_dialect_skips_sql_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("procs.sql"), "CREATE PROCEDURE p AS BEGIN SELECT 1; END\n").unwrap();
+        fs::write(root.join("a.prc"), "CREATE OR REPLACE PROCEDURE ora_p IS\nBEGIN\n  NULL;\nEND;\n/\n").unwrap();
+        fs::write(root.join("lib.py"), "def f():\n    return 1\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        let st = s.index_repo(root).unwrap();
+
+        assert_eq!(st.files, 2, ".sql skipped without a dialect; .prc and .py indexed");
+        let sql_rows: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM files WHERE path LIKE '%.sql'", [], |r| r.get(0)).unwrap();
+        assert_eq!(sql_rows, 0);
+        assert!(s.parse_failures().unwrap().is_empty());
+        let ora: i64 = s.conn.query_row("SELECT COUNT(*) FROM symbols WHERE name='ora_p'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ora, 1);
+    }
+
+    /// L2.2/L1.2 — polyglot scoping across the SQL boundary: the same name defined in `.sql` (pg)
+    /// and `.py` resolves each caller ONLY within its own language.
+    #[test]
+    fn l2_polyglot_sql_python_scoping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.py"), "def shared():\n    return 1\n\ndef py_caller():\n    shared()\n").unwrap();
+        fs::write(
+            root.join("a.sql"),
+            "CREATE FUNCTION shared() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n\
+             CREATE FUNCTION sql_caller() RETURNS int AS $$ SELECT shared() $$ LANGUAGE sql;\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        s.index_repo(root).unwrap();
+
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM symbols WHERE name='shared'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "same-named defs in python and sql-postgres");
+        assert_eq!(resolved(&s, "shared", "py_caller"), ("exact".into(), Some("a.py".into())));
+        assert_eq!(resolved(&s, "shared", "sql_caller"), ("exact".into(), Some("a.sql".into())));
+    }
+
+    /// L2.5 — delta==rebuild equivalence including `.sql` files: a pg function rename relabels its
+    /// edge (and leaves the same-named Python edge alone), and the delta-maintained graph equals a
+    /// cold rebuild (which inherits the persisted dialect from meta).
+    #[test]
+    fn l2_sql_delta_equals_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("lib.py"), "def target():\n    return 1\n").unwrap();
+        fs::write(root.join("app.py"), "def py_use():\n    return target()\n").unwrap();
+        fs::write(
+            root.join("lib.sql"),
+            "CREATE FUNCTION target() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app.sql"),
+            "CREATE FUNCTION sql_use() RETURNS int AS $$ SELECT target() $$ LANGUAGE sql;\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "target", "py_use").0, "exact");
+        assert_eq!(resolved(&s, "target", "sql_use").0, "exact");
+
+        // rename the SQL def only -> SQL edge relabels unresolved, Python edge untouched
+        fs::write(
+            root.join("lib.sql"),
+            "CREATE FUNCTION target2() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n",
+        )
+        .unwrap();
+        let st = s.refresh().unwrap();
+        assert_eq!(st.changed, 1, "only lib.sql re-parsed");
+        assert_eq!(resolved(&s, "target", "sql_use").0, "unresolved", "sql rename relabels the sql edge");
+        assert_eq!(resolved(&s, "target", "py_use").0, "exact", "python edge untouched");
+
+        let delta_proj = graph_projection(&s);
+        let mut s2 = Store::open(root).unwrap();
+        s2.index_repo(root).unwrap();
+        assert_eq!(delta_proj, graph_projection(&s2), "sql delta == rebuild (dialect inherited from meta)");
     }
 }

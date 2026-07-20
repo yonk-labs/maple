@@ -1,9 +1,11 @@
-//! maple CLI — parses source (9 languages, see `parser::LANGS`) into an exact caller/callee graph
+//! maple CLI — parses source (9 languages + 3 SQL dialects, see `parser::LANGS` and
+//! `parser::SqlDialect`) into an exact caller/callee graph
 //! and serves it as JSON: `parse` a single file, `index`/`refresh` a repo into `.maple/graph.db`,
 //! then query it with `closure`, `enumerate`, `bundle`, `exists`, `surface`, `impact`, or serve it
 //! live over MCP.
 
 mod langs;
+mod langs_sql;
 mod mcp;
 mod parser;
 mod store;
@@ -28,9 +30,21 @@ struct Cli {
 enum Cmd {
     /// Parse one source file (any registered language) and print extracted symbols
     /// (defs/calls/imports) as JSON.
-    Parse { path: String },
+    Parse {
+        path: String,
+        /// Dialect for `.sql` files: postgres, tsql, or plsql (L2.1 — the extension alone can't
+        /// name the dialect). Oracle-only extensions (.pks/.pkb/.prc/.fnc/.trg/.pls) never need it.
+        #[arg(long)]
+        sql_dialect: Option<String>,
+    },
     /// Cold full index of a repo into <repo>/.maple/graph.db.
-    Index { repo: String },
+    Index {
+        repo: String,
+        /// Dialect for this repo's `.sql` files: postgres, tsql, or plsql. Persisted in the store,
+        /// so refresh and queries inherit it; without it `.sql` files are not indexed.
+        #[arg(long)]
+        sql_dialect: Option<String>,
+    },
     /// Read counts from an existing store without parsing (no reindex, just reports what's there).
     Status { repo: String },
     /// Depth-1 closure of a symbol: target definition(s) plus its direct callers and callees. JSON.
@@ -146,6 +160,24 @@ fn unparsed_status_line(count: usize, files: &[String]) -> Option<String> {
     }
 }
 
+/// Markdown fence language tag from a file's extension — display-only, for `--format prompt`.
+/// Unknown extensions get a bare fence.
+fn fence_lang(file: &str) -> &'static str {
+    match file.rsplit_once('.').map(|(_, e)| e) {
+        Some("py") => "python",
+        Some("rs") => "rust",
+        Some("c" | "h") => "c",
+        Some("cpp" | "cc" | "hpp" | "hh") => "cpp",
+        Some("cs") => "csharp",
+        Some("java") => "java",
+        Some("js" | "jsx" | "mjs" | "cjs") => "javascript",
+        Some("ts" | "tsx") => "typescript",
+        Some("go") => "go",
+        Some("sql" | "pks" | "pkb" | "prc" | "fnc" | "trg" | "pls") => "sql",
+        _ => "",
+    }
+}
+
 /// W2.3 — render the existing `Bundle` struct as task-ready markdown (`--format prompt`). No
 /// separate assembly path: every field here already exists on `Bundle` for the `json` format.
 /// Markdown fence language for a source file, derived from its extension via
@@ -229,15 +261,19 @@ fn refresh_note(s: &mut store::Store) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Parse { path } => {
-            let lang = require_supported(&path)?;
+        Cmd::Parse { path, sql_dialect } => {
+            let dialect = sql_dialect.as_deref().map(parser::SqlDialect::parse).transpose()?;
+            let lang = require_supported(&path, dialect)?;
             let src = fs::read_to_string(&path)?;
             let parsed = (lang.parse)(&src)?;
             println!("{}", serde_json::to_string_pretty(&parsed)?);
         }
-        Cmd::Index { repo } => {
+        Cmd::Index { repo, sql_dialect } => {
             let root = Path::new(&repo);
             let mut s = store::Store::open(root)?;
+            if let Some(d) = sql_dialect.as_deref() {
+                s.set_sql_dialect(parser::SqlDialect::parse(d)?)?;
+            }
             let st = s.index_repo(root)?;
             println!(
                 "indexed: {} files, {} symbols, {} imports, {} edges (exact {}, ambiguous {}, unresolved {}) -> {}",
@@ -314,9 +350,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// T10.4/L1.1 — an unregistered extension is a clear config error, not silent garbage.
-fn require_supported(path: &str) -> anyhow::Result<&'static parser::LangSpec> {
-    parser::lang_for_path(Path::new(path)).ok_or_else(|| {
-        anyhow::anyhow!("unsupported language for {path}; supported: {}", parser::supported_extensions_list())
+/// L2.1: a `.sql` file without a dialect names the flag instead of pretending to be unsupported.
+fn require_supported(path: &str, sql: Option<parser::SqlDialect>) -> anyhow::Result<&'static parser::LangSpec> {
+    parser::lang_for_path(Path::new(path), sql).ok_or_else(|| {
+        if path.rsplit_once('.').is_some_and(|(_, e)| e == "sql") {
+            anyhow::anyhow!(".sql needs a dialect: pass --sql-dialect=postgres|tsql|plsql")
+        } else {
+            anyhow::anyhow!("unsupported language for {path}; supported: {}", parser::supported_extensions_list())
+        }
     })
 }
 
@@ -383,15 +424,26 @@ mod tests {
 
     /// T10.4/L1.1 — `maple parse` on an unregistered extension is a clear error listing the
     /// supported set; every registered extension resolves to its language.
+    /// L2.1: `.sql` without a dialect names the flag; with one it resolves to that dialect's lang;
+    /// Oracle-only extensions never need the flag.
     #[test]
     fn t10_unknown_language_errors() {
-        let err = require_supported("foo.txt").unwrap_err();
+        let err = require_supported("foo.txt", None).unwrap_err();
         assert!(err.to_string().contains("unsupported language"), "{err}");
         assert!(err.to_string().contains(".py") && err.to_string().contains(".rs"), "{err}");
-        assert_eq!(require_supported("foo.py").unwrap().name, "python");
-        assert_eq!(require_supported("foo.rs").unwrap().name, "rust");
-        assert_eq!(require_supported("foo.tsx").unwrap().name, "typescript");
-        assert_eq!(require_supported("foo.h").unwrap().name, "c");
+        assert_eq!(require_supported("foo.py", None).unwrap().name, "python");
+        assert_eq!(require_supported("foo.rs", None).unwrap().name, "rust");
+        assert_eq!(require_supported("foo.tsx", None).unwrap().name, "typescript");
+        assert_eq!(require_supported("foo.h", None).unwrap().name, "c");
+
+        let err = require_supported("foo.sql", None).unwrap_err();
+        assert!(err.to_string().contains("--sql-dialect"), "{err}");
+        assert_eq!(
+            require_supported("foo.sql", Some(parser::SqlDialect::Postgres)).unwrap().name,
+            "sql-postgres"
+        );
+        assert_eq!(require_supported("foo.sql", Some(parser::SqlDialect::Tsql)).unwrap().name, "sql-tsql");
+        assert_eq!(require_supported("pkg.pkb", None).unwrap().name, "sql-plsql");
     }
 
     /// T15 — the shared parse-failure line: silent when there's nothing to report, and always uses

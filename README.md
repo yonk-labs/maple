@@ -356,8 +356,8 @@ The full evidence trail — methodology, fixtures, and every wave's before/after
 
 ## How it works
 
-1. **Parse.** tree-sitter turns each source file (9 languages — see the table below) into defs,
-   call-sites, imports, and aliases.
+1. **Parse.** tree-sitter turns each source file (9 languages + 3 SQL dialects — see the table
+   below) into defs, call-sites, imports, and aliases.
 2. **Store.** Symbols and calls land in a SQLite graph (`<repo>/.maple/graph.db`).
 3. **Resolve.** Every call-site becomes exactly one edge, deterministically labeled `exact`,
    `ambiguous`, or `unresolved` — never a similarity score, never guessed.
@@ -368,13 +368,13 @@ The full evidence trail — methodology, fixtures, and every wave's before/after
 
 ## Languages
 
-v1.1: 9 languages at the **universal tier** — defs (with parent class/impl-type/receiver
-containers), call-sites split func-vs-method by syntax, imports and aliases, name-based resolution
-**scoped to the caller's language** (a `.rs` call never matches a `.java` def; cross-language calls
-like FFI are honest `unresolved`). Only Python additionally has the **exact resolver** — the
-type-aware layer that binds `self.foo()` / `x = C(); x.foo()` / annotated params / one-hop
-inheritance / import-aware bare calls deterministically. Receiver hints outside Python exist only
-where the syntax hands them over for free; nothing is inferred.
+v1.2: 9 programming languages plus 3 SQL dialects at the **universal tier** — defs (with parent
+class/impl-type/receiver containers), call-sites split func-vs-method by syntax, imports and
+aliases, name-based resolution **scoped to the caller's language** (a `.rs` call never matches a
+`.java` def; cross-language calls like FFI are honest `unresolved`). Only Python additionally has
+the **exact resolver** — the type-aware layer that binds `self.foo()` / `x = C(); x.foo()` /
+annotated params / one-hop inheritance / import-aware bare calls deterministically. Receiver hints
+outside Python exist only where the syntax hands them over for free; nothing is inferred.
 
 | Language | Extensions | Defs + containers | func/method calls | Imports/aliases | Receiver hints | Docstrings |
 |---|---|---|---|---|---|---|
@@ -387,9 +387,21 @@ where the syntax hands them over for free; nothing is inferred.
 | JavaScript | `.js` `.jsx` `.mjs` `.cjs` | ✓ classes + `const x = () =>` arrows | ✓ | ✓ `import {a as b}`, defaults | — | ✓ `/** */` |
 | TypeScript | `.ts` `.tsx` | ✓ (TS + TSX grammars, one language) | ✓ | ✓ `import {a as b}`, defaults | — | ✓ `/** */` |
 | Go | `.go` | ✓ named types + method receivers | ✓ | ✓ import aliases | `w.foo()` on the receiver ident → type | — |
+| PostgreSQL | `.sql`* | ✓ functions/procedures (schema as container); plpgsql + `LANGUAGE sql` dollar-quoted bodies re-parsed for calls | ✓ (`schema.fn()` → method) | — | — | — |
+| T-SQL | `.sql`* | ✓ procedures/functions/triggers (schema as container); `GO` separators handled | ✓ (`EXEC`, `dbo.proc()` → method) | — | — | — |
+| Oracle PL/SQL | `.sql`* `.pks` `.pkb` `.prc` `.fnc` `.trg` `.pls` | ✓ packages as class containers; body members carry the package (spec decls emit no def) | ✓ (`pkg.proc()` → method) | — | — | — |
+
+\* `.sql` alone can't name its dialect and maple never guesses: run
+`maple index <repo> --sql-dialect=postgres|tsql|plsql` once — the setting persists in the store, so
+refresh and queries inherit it. Without it, `.sql` files are skipped. Oracle-only extensions
+(`.pks` etc.) never need the flag. SQL identifiers fold case, so all SQL symbols are stored
+lowercase; common builtins (`count`, `nvl`, `getdate`, ...) are skipped at extraction so
+query-embedded calls don't flood the graph. Dynamic SQL (`EXECUTE IMMEDIATE`, `sp_executesql`) is
+never extracted — honest absence over guessing.
 
 Shallow by design: the universal tier extracts what the syntax states and resolves by name within
-the language — it over-reports `ambiguous`/`unresolved` rather than guess (C++ especially).
+the language — it over-reports `ambiguous`/`unresolved` rather than guess (C++ especially, and
+legacy T-SQL with unparenthesized parameter lists extracts partially).
 
 ## Status
 
