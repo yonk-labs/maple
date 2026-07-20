@@ -400,8 +400,11 @@ query-embedded calls don't flood the graph. Dynamic SQL (`EXECUTE IMMEDIATE`, `s
 never extracted — honest absence over guessing.
 
 Shallow by design: the universal tier extracts what the syntax states and resolves by name within
-the language — it over-reports `ambiguous`/`unresolved` rather than guess (C++ especially, and
-legacy T-SQL with unparenthesized parameter lists extracts partially).
+the language — it over-reports `ambiguous`/`unresolved` rather than guess (C++ especially). T-SQL
+grammar gaps (legacy unparenthesized parameter lists, `OPENJSON ... WITH`, multi-statement
+table-valued functions) cost some extraction — affected files are flagged in `parse_failures`, so
+the graph always reports its holes (measured ~87% file-level proc recall on Microsoft's
+WideWorldImporters).
 
 ## Status
 

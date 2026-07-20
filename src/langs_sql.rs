@@ -81,6 +81,12 @@ const TSQL_BUILTINS: &[&str] = &[
 /// `GO` batch separators live on their own line (sqlcmd rule: optionally `GO <count>`) but the
 /// grammar mis-parses them — rewrite each such line to `;` so the grammar sees a plain statement
 /// boundary. Line-wise rewrite, so every extracted line number stays exact.
+///
+/// Procedure-option `WITH` lines (`WITH EXECUTE AS OWNER`, `WITH RECOMPILE`, ...) sit between the
+/// proc header and `AS` and the grammar doesn't know them — one collapses the entire definition
+/// into an ERROR (every SSDT-generated proc uses `WITH EXECUTE AS ...`). Blank them. CTE
+/// disambiguation: a CTE line (`WITH x AS (`) always involves a `(`; a proc-option line never
+/// does, and its second word comes from a tiny closed keyword set nobody names a CTE after.
 fn strip_go_lines(src: &str) -> String {
     src.lines()
         .map(|line| {
@@ -92,10 +98,21 @@ fn strip_go_lines(src: &str) -> String {
                     && t[2..].starts_with(char::is_whitespace)
                     && t[2..].trim().chars().all(|c| c.is_ascii_digit()));
             if is_go {
-                ";"
-            } else {
-                line
+                return ";";
             }
+            if !t.contains('(') {
+                let words: Vec<String> =
+                    t.split_whitespace().take(3).map(str::to_lowercase).collect();
+                let opt = matches!(
+                    words.get(1).map(String::as_str),
+                    Some("recompile" | "encryption" | "schemabinding" | "native_compilation")
+                ) || (words.get(1).map(String::as_str) == Some("execute")
+                    && words.get(2).map(String::as_str) == Some("as"));
+                if words.first().map(String::as_str) == Some("with") && opt {
+                    return "";
+                }
+            }
+            line
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -616,6 +633,32 @@ GO 2
         // builtins skipped
         assert!(!p.calls.iter().any(|c| c.name == "count" || c.name == "sum"));
         assert!(p.symbolless_ok, "GO-stripped source parses clean");
+    }
+
+    /// SSDT-style `WITH EXECUTE AS OWNER` between header and AS must not collapse the def;
+    /// a real CTE (`WITH x AS (...)`) survives the blanking untouched.
+    #[test]
+    fn tsql_proc_options_blanked_ctes_kept() {
+        let src = "\
+CREATE PROCEDURE [WebApi].[DeletePackageType](@PackageTypeID int)
+WITH EXECUTE AS OWNER
+AS BEGIN
+    DELETE Warehouse.PackageTypes
+    WHERE PackageTypeID = @PackageTypeID;
+END
+GO
+CREATE PROCEDURE Reporting.Summarize
+AS BEGIN
+    WITH recent AS (SELECT OrderID FROM Orders)
+    SELECT dbo.OrderTotal(OrderID) FROM recent;
+END
+GO
+";
+        let p = parse_tsql(src).unwrap();
+        assert!(p.defs.iter().any(|d| d.name == "deletepackagetype" && d.parent_class.as_deref() == Some("webapi")));
+        assert!(p.defs.iter().any(|d| d.name == "summarize"));
+        // the CTE body still parses: the call inside it extracts
+        assert!(p.calls.iter().any(|c| c.name == "ordertotal" && c.enclosing == "summarize"));
     }
 
     #[test]
