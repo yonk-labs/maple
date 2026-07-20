@@ -18,6 +18,23 @@ const SKIP_DIRS: &[&str] = &[
     ".mypy_cache", "vendor",
 ];
 
+/// Per-file parse cap. tree-sitter trees run ~30-40x source size in memory, and the parallel
+/// parse holds several at once — a real corpus with two 476 MB data-dump .sql files took the
+/// indexer past 18 GB RSS before being killed. 64 MB passes every legitimate source file seen in
+/// testing (largest real one: a 28 MB production DDL dump) while data dumps skip with an honest
+/// parse_failures entry — visible in `status`/bundle reports, never a silent hole.
+const MAX_PARSE_BYTES: usize = 64 * 1024 * 1024;
+
+fn parse_cap_error(len: usize) -> Option<String> {
+    (len > MAX_PARSE_BYTES).then(|| {
+        format!(
+            "skipped: {} MB exceeds the {} MB per-file parse cap (split the file, or use `maple parse` directly)",
+            len / (1024 * 1024),
+            MAX_PARSE_BYTES / (1024 * 1024)
+        )
+    })
+}
+
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS files (
   path TEXT PRIMARY KEY, hash TEXT NOT NULL, lang TEXT NOT NULL);
@@ -118,6 +135,10 @@ fn parse_one_file(path: &Path, rel: String, sql: Option<crate::parser::SqlDialec
     let lang = crate::parser::lang_for_path(path, sql).expect("walker only yields registered extensions");
     let outcome = match std::fs::read(path) {
         Err(e) => ParseOutcome::Unreadable(format!("unreadable: {e}")),
+        Ok(bytes) if parse_cap_error(bytes.len()).is_some() => {
+            // hash recorded so delta doesn't retry every refresh — only a content change does
+            ParseOutcome::ParseErr { hash: hash_bytes(&bytes), err: parse_cap_error(bytes.len()).unwrap() }
+        }
         Ok(bytes) => {
             let src = String::from_utf8_lossy(&bytes);
             let hash = hash_bytes(&bytes);
@@ -1065,6 +1086,9 @@ impl Store {
                 let lang = crate::parser::lang_for_path(Path::new(f), sql)
                     .expect("changed set only holds registered files");
                 let (hash, bytes) = &disk[f];
+                if let Some(err) = parse_cap_error(bytes.len()) {
+                    return (f.clone(), lang.name, ParseOutcome::ParseErr { hash: hash.clone(), err });
+                }
                 let src = String::from_utf8_lossy(bytes);
                 let outcome = match (lang.parse)(&src) {
                     Err(e) => ParseOutcome::ParseErr { hash: hash.clone(), err: e.to_string() },
@@ -3699,6 +3723,31 @@ mod tests {
             .collect::<std::result::Result<_, _>>()
             .unwrap();
         assert_eq!(labels, vec!["exact".to_string(), "ambiguous".to_string()], "bare call stays ambiguous");
+    }
+
+    /// Oversized files (real corpora ship 476 MB data-dump .sql files; tree-sitter trees are
+    /// ~30-40x source in memory) are skipped with an honest parse_failures entry instead of
+    /// eating all RAM; a normal-size sibling still indexes, and delta doesn't retry the skip.
+    #[test]
+    fn parse_cap_skips_oversized_files_honestly() {
+        assert!(parse_cap_error(MAX_PARSE_BYTES).is_none(), "cap is exclusive");
+        let msg = parse_cap_error(MAX_PARSE_BYTES + 1).unwrap();
+        assert!(msg.contains("64 MB per-file parse cap"), "{msg}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("big.py"), vec![b'#'; MAX_PARSE_BYTES + 1]).unwrap();
+        fs::write(root.join("lib.py"), "def ok():\n    return 1\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        let st = s.index_repo(root).unwrap();
+        assert_eq!(st.symbols, 1, "only the normal file contributes symbols");
+        let file_rows: i64 = s.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(file_rows, 2, "skipped file still recorded (hash prevents delta retries)");
+        let failures = s.parse_failures().unwrap();
+        assert_eq!(failures, vec!["big.py".to_string()]);
+        // delta: nothing changed -> the oversized file is NOT retried (hash recorded)
+        let st2 = s.refresh().unwrap();
+        assert_eq!((st2.changed, st2.deleted), (0, 0));
     }
 
     /// L2.1 — no dialect set: `.sql` files are not indexed at all (no defs, no suspect noise), and
