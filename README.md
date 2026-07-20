@@ -389,7 +389,7 @@ outside Python exist only where the syntax hands them over for free; nothing is 
 | Go | `.go` | ✓ named types + method receivers | ✓ | ✓ import aliases | `w.foo()` on the receiver ident → type | — |
 | PostgreSQL | `.sql`* | ✓ functions/procedures (schema as container); plpgsql + `LANGUAGE sql` dollar-quoted bodies re-parsed for calls | ✓ (`schema.fn()` → method) | — | — | — |
 | T-SQL | `.sql`* | ✓ procedures/functions/triggers (schema as container); `GO` separators handled | ✓ (`EXEC`, `dbo.proc()` → method) | — | — | — |
-| Oracle PL/SQL | `.sql`* `.pks` `.pkb` `.prc` `.fnc` `.trg` `.pls` | ✓ packages as class containers; body members carry the package (spec decls emit no def) | ✓ (`pkg.proc()` → method) | — | — | — |
+| Oracle PL/SQL | `.sql`* `.pks` `.pkb` `.prc` `.fnc` `.trg` `.pls` | ✓ packages/object types as class containers; body members carry the package (spec decls emit no def) | ✓ (`pkg.proc()` → method) | — | `pkg.proc()` → pkg (the qualifier is free) | — |
 
 \* `.sql` alone can't name its dialect and maple never guesses: run
 `maple index <repo> --sql-dialect=postgres|tsql|plsql` once — the setting persists in the store, so

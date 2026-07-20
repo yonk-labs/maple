@@ -5,8 +5,9 @@
 //!   name is qualified); Oracle packages (spec and body) -> `class` containers; package BODY
 //!   members carry `parent_class` = package. Spec/forward DECLARATIONS emit no def (C-header honesty).
 //! - calls: bare `proc(x)` / `CALL` / `EXEC` / `PERFORM` -> kind `func`; qualified
-//!   `pkg.proc()` / `schema.fn()` -> kind `method` on the member name. No receiver hints (nothing
-//!   is syntactically free in SQL). Dynamic SQL stays unextracted (honest unresolved-by-absence).
+//!   `pkg.proc()` / `schema.fn()` -> kind `method` on the member name. One receiver hint exists:
+//!   PL/SQL's package qualifier (`pkg.proc()` -> hint `pkg`) — it's syntactically free, like a Go
+//!   receiver. Dynamic SQL stays unextracted (honest unresolved-by-absence).
 //! - identifiers fold case in every dialect, so every extracted name is lowercased (`norm`); the
 //!   store's case-sensitive resolution needs no change.
 //! - common builtins (`count`, `nvl`, `getdate`, ...) are skipped at extraction so query-embedded
@@ -183,22 +184,46 @@ const PLSQL_BUILTINS: &[&str] = &[
 /// (line-preserving, like the T-SQL `GO` rewrite). `set` needs care: `UPDATE ...\nSET col = 1`
 /// puts SET at line start in real SQL, so it's blanked only for a known SQL*Plus parameter name
 /// with no `=` after it.
+///
+/// `grant`/`revoke` are blanked for a different reason: the grammar has no GRANT rule and
+/// tree-sitter's error recovery goes QUADRATIC on long grant runs — a real production DDL dump
+/// with ~150k grant lines went from a projected ~34 min to seconds. They carry no graph
+/// information (no defs, no calls). A grant continuation line or a `GRANT` line inside a dynamic
+/// SQL string can survive blanking or lose a line of literal text — both inert for extraction.
 fn strip_sqlplus_lines(src: &str) -> String {
     const DIRECTIVES: &[&str] =
-        &["rem", "remark", "prompt", "spool", "show", "whenever", "define", "undefine"];
+        &["rem", "remark", "prompt", "spool", "show", "whenever", "define", "undefine", "grant", "revoke"];
     const SET_PARAMS: &[&str] = &[
         "autocommit", "colsep", "echo", "feedback", "heading", "linesize", "long",
         "longchunksize", "newpage", "numwidth", "pagesize", "pause", "serveroutput",
         "sqlblanklines", "tab", "termout", "timing", "trimout", "trimspool", "verify", "wrap",
     ];
+    // EDB DDL-extractor dumps embed object-dependency CSV between explicit comment markers —
+    // ~20k+ rows of quoted tuples that aren't SQL and send error recovery quadratic (measured:
+    // ~275s of a 280s parse on a real 660k-line production dump). The markers are exact, so
+    // blanking the enclosed section is deterministic. CSV blobs WITHOUT these markers stay slow —
+    // ponytail: add shape-based CSV detection only if a non-EDB corpus ever needs it.
+    let mut in_deps = false;
     src.lines()
         .map(|line| {
+            let t = line.trim();
+            if t == "--START_OF_DEPENDENCIES" {
+                in_deps = true;
+            } else if t == "--END_OF_DEPENDENCIES" {
+                in_deps = false;
+            }
+            if in_deps {
+                return "";
+            }
             let t = line.trim_start();
             let mut words = t.split_whitespace();
             let first = words.next().unwrap_or("").to_lowercase();
             let second = words.next().unwrap_or("").to_lowercase();
             let third = words.next().unwrap_or("");
+            // '#' never starts a SQL/PLSQL statement — extractor tools (EDB DDL extractor) emit
+            // `####...` banner lines whose ERROR recovery swallows whole neighboring statements.
             let is_directive = t.starts_with('@')
+                || t.starts_with('#')
                 || DIRECTIVES.contains(&first.as_str())
                 || (first == "set" && SET_PARAMS.contains(&second.as_str()) && !third.starts_with('='));
             if is_directive {
@@ -289,15 +314,32 @@ fn walk_plsql(
             }
         }
         // `name(...)` anywhere — qualified (`pkg.proc`, `schema.pkg.proc`) -> method kind on the
-        // member name. PL/SQL can't syntactically split collection indexing from calls, so
-        // `arr(i)` is extracted too — honest over-report, resolves unresolved.
+        // member name, with the qualifier as a receiver-class hint: it's syntactically free (like
+        // a Go receiver) and lets `htp.print()` vs `htf.print()` resolve to the right package's
+        // member instead of cross-package ambiguity. Validation happens at resolution time (the
+        // hint only applies when it names class-kind symbols); a schema qualifier names no class
+        // and falls back to today's behavior. PL/SQL can't syntactically split collection indexing
+        // from calls, so `arr(i)` is extracted too — honest over-report, resolves unresolved.
         "ref_call" if !in_error => {
             if let Some(re) = find_child(node, "referenced_element") {
                 if let Some(nm) = re.child_by_field_name("ref_name") {
-                    let qualified = re.child_by_field_name("ref_name_parent").is_some()
-                        || re.child_by_field_name("schema_name").is_some();
-                    let kind = if qualified { "method" } else { "func" };
-                    push_call(out, PLSQL_BUILTINS, text(nm, src), kind, node.start_position().row + 1, enclosing);
+                    let parent = re.child_by_field_name("ref_name_parent").map(|p| norm(text(p, src)));
+                    let kind = if parent.is_some() || re.child_by_field_name("schema_name").is_some() {
+                        "method"
+                    } else {
+                        "func"
+                    };
+                    let line = node.start_position().row + 1;
+                    let name = norm(text(nm, src));
+                    if !name.is_empty() && !PLSQL_BUILTINS.contains(&name.as_str()) {
+                        out.calls.push(CallSite {
+                            name,
+                            kind: kind.into(),
+                            line,
+                            enclosing: enclosing.to_string(),
+                            receiver_class: parent,
+                        });
+                    }
                 }
             }
         }
@@ -623,6 +665,32 @@ END;
         assert!(p.calls.iter().any(|c| c.name == "write" && c.kind == "method" && c.enclosing == "process_order"));
         assert!(p.calls.iter().any(|c| c.name == "audit_order" && c.kind == "func"));
         assert!(p.symbolless_ok);
+    }
+
+    /// The package qualifier is a receiver hint: `a_pkg.write()` and `b_pkg.write()` each carry
+    /// their package, so twin-API packages (Oracle's htp/htf shape) resolve to the right member
+    /// instead of cross-package ambiguity.
+    #[test]
+    fn plsql_package_qualifier_is_receiver_hint() {
+        let src = "\
+CREATE OR REPLACE PACKAGE BODY a_pkg AS
+  PROCEDURE write(s VARCHAR2) IS BEGIN NULL; END;
+END a_pkg;
+/
+CREATE OR REPLACE PACKAGE BODY b_pkg AS
+  PROCEDURE write(s VARCHAR2) IS BEGIN NULL; END;
+END b_pkg;
+/
+CREATE OR REPLACE PROCEDURE caller IS
+BEGIN
+  a_pkg.write('x');
+END;
+/
+";
+        let p = parse_plsql(src).unwrap();
+        let call = p.calls.iter().find(|c| c.name == "write").unwrap();
+        assert_eq!(call.kind, "method");
+        assert_eq!(call.receiver_class.as_deref(), Some("a_pkg"));
     }
 
     /// SQL*Plus directive runs must not swallow the following CREATE (Oracle sample-schema shape);

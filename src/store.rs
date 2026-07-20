@@ -1671,7 +1671,7 @@ fn resolve_call(
                 if cands.len() > 1 && lang == "python" && is_external_receiver(conn, rc, call_site_file)? {
                     return Ok((None, "unresolved"));
                 }
-            } else if kinds.len() == 1 && kinds[0] == "class" {
+            } else if hint_names_a_class(&kinds, lang) {
                 let filt: Vec<&(i64, Option<String>, String)> =
                     cands.iter().filter(|(_, pc, _)| pc.as_deref() == Some(rc)).collect();
                 match filt.len() {
@@ -1727,6 +1727,20 @@ fn resolve_call(
         1 => (Some(cands[0].0), "exact"),
         _ => (None, "ambiguous"),
     })
+}
+
+/// Receiver-hint validation: the hint is trusted only when `rc` names class-kind symbols.
+/// Python (and the other L1 languages): EXACTLY one class symbol — two same-named classes make
+/// the binding a guess. SQL dialects: a package/type legitimately has spec AND body class defs
+/// (same name, both real containers), so the hint applies when ALL symbols named `rc` are classes
+/// — the parent_class filter below then picks the member, and multiple member matches still land
+/// `ambiguous`. Lang-gated so L1-language behavior stays byte-identical.
+fn hint_names_a_class(kinds: &[String], lang: &str) -> bool {
+    if lang.starts_with("sql-") {
+        !kinds.is_empty() && kinds.iter().all(|k| k == "class")
+    } else {
+        kinds.len() == 1 && kinds[0] == "class"
+    }
 }
 
 /// T4 — single-hop inheritance: `rc` (already validated as a class with no own method `name`)
@@ -3644,6 +3658,47 @@ mod tests {
         );
         assert_eq!(edge_kinds(&s, "process_order", "nightly").1, "method");
         assert_eq!(resolved(&s, "helper_only", "nightly").0, "unresolved");
+    }
+
+    /// L2 — PL/SQL package-qualifier receiver hint: two packages with the same member name (the
+    /// Oracle htp/htf twin-API shape) resolve a qualified call EXACTLY to the named package's
+    /// member; an unqualified same-name call stays honestly ambiguous.
+    #[test]
+    fn l2_plsql_package_hint_disambiguates_twin_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("a_pkg.pkb"),
+            "CREATE OR REPLACE PACKAGE BODY a_pkg AS\n  PROCEDURE write(s VARCHAR2) IS BEGIN NULL; END;\nEND a_pkg;\n/\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b_pkg.pkb"),
+            "CREATE OR REPLACE PACKAGE BODY b_pkg AS\n  PROCEDURE write(s VARCHAR2) IS BEGIN NULL; END;\nEND b_pkg;\n/\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("caller.prc"),
+            "CREATE OR REPLACE PROCEDURE caller IS\nBEGIN\n  a_pkg.write('x');\n  write('y');\nEND;\n/\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(
+            resolved(&s, "write", "caller"),
+            ("exact".into(), Some("a_pkg.pkb".into())),
+            "qualified call binds to the named package's member"
+        );
+        let labels: Vec<String> = s
+            .conn
+            .prepare("SELECT kind FROM edges WHERE callee_name='write' ORDER BY call_site_line")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(labels, vec!["exact".to_string(), "ambiguous".to_string()], "bare call stays ambiguous");
     }
 
     /// L2.1 — no dialect set: `.sql` files are not indexed at all (no defs, no suspect noise), and
