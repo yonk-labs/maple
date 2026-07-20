@@ -88,7 +88,8 @@ const TSQL_BUILTINS: &[&str] = &[
 /// disambiguation: a CTE line (`WITH x AS (`) always involves a `(`; a proc-option line never
 /// does, and its second word comes from a tiny closed keyword set nobody names a CTE after.
 fn strip_go_lines(src: &str) -> String {
-    src.lines()
+    let mut lines: Vec<String> = src
+        .lines()
         .map(|line| {
             let t = line.trim();
             let is_go = t.eq_ignore_ascii_case("go")
@@ -98,7 +99,7 @@ fn strip_go_lines(src: &str) -> String {
                     && t[2..].starts_with(char::is_whitespace)
                     && t[2..].trim().chars().all(|c| c.is_ascii_digit()));
             if is_go {
-                return ";";
+                return ";".to_string();
             }
             if !t.contains('(') {
                 let words: Vec<String> =
@@ -109,13 +110,138 @@ fn strip_go_lines(src: &str) -> String {
                 ) || (words.get(1).map(String::as_str) == Some("execute")
                     && words.get(2).map(String::as_str) == Some("as"));
                 if words.first().map(String::as_str) == Some("with") && opt {
-                    return "";
+                    return String::new();
                 }
             }
-            line
+            line.to_string()
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    fix_tsql_proc_shapes(&mut lines);
+    lines.join("\n")
+}
+
+/// Two classic T-SQL proc shapes the grammar doesn't know, both the house style of entire real
+/// codebases (DNN: 500+ procs) and both collapsing the WHOLE definition (defs AND calls) when hit:
+///
+/// 1. bare parameter lists (`CREATE PROCEDURE dbo.X` newline `@a int, @b int` newline `AS`) ->
+///    append `(` to the header line, prefix the closing `AS` line with `) `.
+/// 2. bodies without BEGIN/END (`AS <statements>` to end of batch) -> append ` begin` after the
+///    AS token and close with `end` at the batch terminator: the `;` line GO became, the next
+///    CREATE header, or EOF (one appended line at EOF shifts no existing row).
+///
+/// Deterministic and line-preserving for all existing content: only columns shift, and rows are
+/// all maple records. The param scan aborts (no edit) if a body keyword appears before `AS` —
+/// never guess. Single-line bare-param headers (`CREATE PROC p @x int AS ...`) are left alone:
+/// rarer, and wrongly splicing one line is worse than missing it.
+fn fix_tsql_proc_shapes(lines: &mut Vec<String>) {
+    fn first_word(s: &str) -> String {
+        s.split_whitespace().next().unwrap_or("").to_lowercase()
+    }
+    // create [or alter] proc|procedure [name-with-no-params-yet]; `bare` = header line ends at
+    // the name (candidate for param wrapping). Functions keep their own body grammar — procs only.
+    fn proc_header(line: &str) -> Option<bool> {
+        let w: Vec<String> = line.split_whitespace().map(str::to_lowercase).collect();
+        let rest: &[String] = match w.split_first() {
+            Some((c, rest)) if c == "create" => rest,
+            _ => return None,
+        };
+        let rest = match rest.split_first() {
+            Some((o, r)) if o == "or" => match r.split_first() {
+                Some((a, r2)) if a == "alter" => r2,
+                _ => return None,
+            },
+            _ => rest,
+        };
+        match rest.split_first() {
+            Some((kw, tail)) if matches!(kw.as_str(), "proc" | "procedure") => {
+                Some(tail.len() == 1 && !tail[0].contains('('))
+            }
+            _ => None,
+        }
+    }
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(bare) = proc_header(&lines[i]) else {
+            i += 1;
+            continue;
+        };
+        // find the standalone AS that opens the body (skipping the param block when present)
+        let mut as_line = None;
+        let mut j = i + 1;
+        while j < lines.len() {
+            let fw = first_word(&lines[j]);
+            if fw == "as" || fw == ")" && lines[j].trim_start()[1..].trim_start().to_lowercase().starts_with("as") {
+                as_line = Some(j);
+                break;
+            }
+            if matches!(fw.as_str(), "begin" | "select" | "insert" | "update" | "delete" | "declare" | "set" | "create" | "exec" | "execute" | "return") {
+                break;
+            }
+            j += 1;
+        }
+        let Some(k) = as_line else {
+            i += 1;
+            continue;
+        };
+        // shape 1: wrap a bare param block (first non-blank/comment line after header starts @)
+        if bare {
+            let mut p = i + 1;
+            while p < lines.len() && (lines[p].trim().is_empty() || lines[p].trim_start().starts_with("--")) {
+                p += 1;
+            }
+            if p < k && lines[p].trim_start().starts_with('@') {
+                lines[i].push('(');
+                let indent = lines[k].len() - lines[k].trim_start().len();
+                lines[k].insert_str(indent, ") ");
+            }
+        }
+        // shape 2: body without BEGIN — inject `begin` after AS, `end` at the batch terminator
+        let after_as = {
+            let t = lines[k].trim_start();
+            let t = t.strip_prefix(") ").unwrap_or(t);
+            t[2..].trim_start().to_string() // past "as"/"AS"
+        };
+        let next_content = if after_as.is_empty() {
+            (k + 1..lines.len())
+                .map(|n| lines[n].trim())
+                .find(|t| !t.is_empty() && !t.starts_with("--"))
+                .unwrap_or("")
+                .to_string()
+        } else {
+            after_as
+        };
+        if !next_content.to_lowercase().starts_with("begin") {
+            let mut end_at = None; // line index of `;` (from GO) or next CREATE, else EOF
+            for (n, line) in lines.iter().enumerate().skip(k + 1) {
+                let t = line.trim();
+                if t == ";" || first_word(t) == "create" {
+                    end_at = Some(n);
+                    break;
+                }
+            }
+            // insert right after the `as` token (there may be body content on the same line)
+            let mut pos = lines[k].len() - lines[k].trim_start().len();
+            if lines[k][pos..].starts_with(") ") {
+                pos += 2;
+            }
+            pos += 2; // the as/AS token itself
+            lines[k].insert_str(pos, " begin");
+            match end_at {
+                Some(n) => {
+                    let indent = lines[n].len() - lines[n].trim_start().len();
+                    lines[n].insert_str(indent, "end ");
+                    i = n;
+                }
+                None => {
+                    lines.push("end".to_string());
+                    i = lines.len();
+                }
+            }
+        } else {
+            i = k;
+        }
+        i += 1;
+    }
 }
 
 pub fn parse_tsql(src: &str) -> anyhow::Result<ParsedFile> {
@@ -659,6 +785,51 @@ GO
         assert!(p.defs.iter().any(|d| d.name == "summarize"));
         // the CTE body still parses: the call inside it extracts
         assert!(p.calls.iter().any(|c| c.name == "ordertotal" && c.enclosing == "summarize"));
+    }
+
+    /// DNN-style procs: bare unparenthesized parameter list AND a body with no BEGIN/END, batch
+    /// ending at EOF — both rewritten line-preservingly; def lines must match the original file.
+    #[test]
+    fn tsql_bare_params_and_no_begin_body() {
+        let src = "\
+create procedure dbo.AddAnnouncement
+
+@ModuleId       int,
+@UserName       nvarchar(100),
+@ViewOrder\tint
+
+as
+
+insert into Announcements (ModuleId, CreatedByUser)
+values (@ModuleId, @UserName)
+
+select SCOPE_IDENTITY()";
+        let p = parse_tsql(src).unwrap();
+        let d = p.defs.iter().find(|d| d.name == "addannouncement").expect("def extracted");
+        assert_eq!(d.parent_class.as_deref(), Some("dbo"));
+        assert_eq!(d.start_line, 1);
+        assert!(!p.calls.iter().any(|c| c.name == "scope_identity"), "builtin skipped");
+    }
+
+    /// Same shapes across GO-separated batches: the injected END lands on the batch boundary and
+    /// the second proc still extracts; calls inside no-BEGIN bodies extract too.
+    #[test]
+    fn tsql_no_begin_bodies_across_batches() {
+        let src = "\
+create procedure dbo.First
+@x int
+as
+exec dbo.LogAccess @x
+GO
+create procedure dbo.Second
+as
+select 1
+GO
+";
+        let p = parse_tsql(src).unwrap();
+        assert!(p.defs.iter().any(|d| d.name == "first" && d.start_line == 1));
+        assert!(p.defs.iter().any(|d| d.name == "second" && d.start_line == 6));
+        assert!(p.calls.iter().any(|c| c.name == "logaccess" && c.enclosing == "first" && c.line == 4));
     }
 
     #[test]
