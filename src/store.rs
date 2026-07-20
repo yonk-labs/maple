@@ -617,7 +617,7 @@ impl Store {
             // the git-aware O(changes) fast path immediately (skipped for non-git repos, or when
             // HEAD can't be read — e.g. a repo with zero commits yet).
             if let Some(head) = git_rev_parse_head(root) {
-                record_git_state(&tx, root, &head)?;
+                record_git_state(&tx, root, &head, None)?;
             }
         }
         tx.commit()?;
@@ -735,11 +735,29 @@ impl Store {
     /// (`pkg/mod.py`) or a dotted path (`pkg.mod`). A module with no matching file (not yet created,
     /// or never indexed) returns an empty surface — not an error (Day-0 friendly).
     pub fn surface(&self, module: &str) -> Result<Surface> {
-        let file_pat = module_to_file(module);
-        let canonical: Option<String> = self
-            .conn
-            .query_row("SELECT path FROM files WHERE path=?1 OR path LIKE '%/' || ?1 LIMIT 1", [&file_pat], |r| r.get(0))
-            .optional()?;
+        let mut file_pat = module_to_file(module);
+        let lookup = |pat: &String| -> Result<Option<String>> {
+            Ok(self
+                .conn
+                .query_row("SELECT path FROM files WHERE path=?1 OR path LIKE '%/' || ?1 LIMIT 1", [pat], |r| {
+                    r.get(0)
+                })
+                .optional()?)
+        };
+        let mut canonical = lookup(&file_pat)?;
+        // L2 review fix — `a.b.sql` (or `.go`, `.rs`, ...) is ambiguous: a literal file `b.sql`,
+        // or a dotted Python path whose last module is named `sql`. Deterministic precedence: a
+        // literal file that EXISTS in the store wins; otherwise retry the dotted interpretation.
+        // (e.g. `django.db.models.sql` addresses `django/db/models/sql.py` again.)
+        if canonical.is_none() && !module.contains('/') && module.contains('.') {
+            let dotted = format!("{}.py", module.replace('.', "/"));
+            if dotted != file_pat {
+                if let Some(hit) = lookup(&dotted)? {
+                    canonical = Some(hit);
+                    file_pat = dotted;
+                }
+            }
+        }
         let file = canonical.unwrap_or(file_pat);
 
         let mut stmt = self.conn.prepare(
@@ -918,6 +936,9 @@ impl Store {
         // in doubt, walk.
         let mut candidate_paths: Option<Vec<String>> = None;
         let mut observed_head: Option<String> = None;
+        // the porcelain output fetched for the fast path, kept for record_git_state at the end so
+        // the hot no-change query path runs `git status` once per refresh, not twice.
+        let mut porcelain_snapshot: Option<String> = None;
         if root.join(".git").exists() {
             if let Some(head) = git_rev_parse_head(&root) {
                 let stored_head: Option<String> = self
@@ -927,6 +948,7 @@ impl Store {
                 if stored_head.as_deref() == Some(head.as_str()) {
                     if let Some(status) = git_status_porcelain(&root) {
                         let mut cand = parse_porcelain_paths(&status);
+                        porcelain_snapshot = Some(status);
                         // T12 fix: a file that was DIRTY when the store last recorded this HEAD
                         // may since have been reverted (git checkout/stash) — porcelain no longer
                         // names it, but the store still holds its dirty-time contents. Union in
@@ -1001,7 +1023,7 @@ impl Store {
             // still record the observed HEAD (idempotent) so a HEAD-changed fallback run with a
             // genuinely empty diff still unlocks the fast path on the next call.
             if let Some(head) = &observed_head {
-                record_git_state(&self.conn, &root, head)?;
+                record_git_state(&self.conn, &root, head, porcelain_snapshot.as_deref())?;
             }
             return Ok(st);
         }
@@ -1170,7 +1192,7 @@ impl Store {
         // T12: record the HEAD this refresh reflects, atomically with the rest of the update, so
         // the next call can trust the git-aware fast path from here.
         if let Some(head) = &observed_head {
-            record_git_state(&tx, &root, head)?;
+            record_git_state(&tx, &root, head, porcelain_snapshot.as_deref())?;
         }
         tx.commit()?;
         Ok(st)
@@ -1436,18 +1458,33 @@ pub fn seed(target: &Path, source: &Path, force: bool) -> Result<RefreshStats> {
 /// reverted later (git checkout/stash), after which porcelain goes silent about it while the store
 /// still holds its dirty-time contents — the next refresh must hash-compare it anyway. Works on a
 /// `Transaction` too (derefs to `Connection`).
-fn record_git_state(conn: &Connection, root: &Path, head: &str) -> Result<()> {
+///
+/// `status`: the porcelain output the caller already fetched this call (refresh's fast path), so
+/// the hot no-change query path spawns `git status` once, not twice; `None` fetches here (cold
+/// index, HEAD-moved fallback). If the status fetch FAILS, the previously recorded dirty set is
+/// left untouched — never shrink the staleness safety net on a transient git error (correctness
+/// first: when in doubt, keep hash-comparing those paths).
+fn record_git_state(conn: &Connection, root: &Path, head: &str, status: Option<&str>) -> Result<()> {
     conn.execute(
         "INSERT INTO meta(key,value) VALUES('last_indexed_head',?1) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [head],
     )?;
-    let dirty = git_status_porcelain(root).map(|s| parse_porcelain_paths(&s).join("\n")).unwrap_or_default();
-    conn.execute(
-        "INSERT INTO meta(key,value) VALUES('dirty_at_head',?1) \
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [dirty],
-    )?;
+    let fetched;
+    let status = match status {
+        Some(s) => Some(s),
+        None => {
+            fetched = git_status_porcelain(root);
+            fetched.as_deref()
+        }
+    };
+    if let Some(s) = status {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('dirty_at_head',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [parse_porcelain_paths(s).join("\n")],
+        )?;
+    }
     Ok(())
 }
 
@@ -3442,6 +3479,61 @@ mod tests {
         let mut s2 = Store::open(root).unwrap();
         s2.index_repo(root).unwrap();
         assert_eq!(delta_proj, graph_projection(&s2), "mixed-language delta == rebuild");
+    }
+
+    /// Review fix — `--module a.b.sql` is ambiguous now that `.sql` is a registered extension: it
+    /// must still address `a/b/sql.py` when no literal file matches (django.db.models.sql pattern),
+    /// while a literal indexed `.sql` file keeps winning when it exists.
+    #[test]
+    fn surface_dotted_module_named_sql_still_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("myapp/db")).unwrap();
+        fs::write(root.join("myapp/db/sql.py"), "def compile_query():\n    return 1\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        let sf = s.surface("myapp.db.sql").unwrap();
+        assert_eq!(sf.defs.len(), 1, "dotted path ending in a module named `sql` resolves");
+        assert_eq!(sf.defs[0].name, "compile_query");
+
+        // literal-file precedence: an indexed db/sql.sql wins over the dotted reading
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root2 = tmp2.path();
+        fs::create_dir_all(root2.join("db")).unwrap();
+        fs::write(
+            root2.join("db/sql.sql"),
+            "CREATE FUNCTION from_sql_file() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n",
+        )
+        .unwrap();
+        let mut s2 = Store::open(root2).unwrap();
+        s2.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        s2.index_repo(root2).unwrap();
+        let sf2 = s2.surface("db/sql.sql").unwrap();
+        assert_eq!(sf2.defs.len(), 1);
+        assert_eq!(sf2.defs[0].name, "from_sql_file");
+    }
+
+    /// Review fix — a failed `git status` at record time must PRESERVE the previously recorded
+    /// dirty set, not wipe it (wiping reopens the T12 staleness window for one generation).
+    #[test]
+    fn record_git_state_preserves_dirty_set_on_status_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path(); // NOT a git repo -> git_status_porcelain returns None
+        let s = Store::open(root).unwrap();
+        s.conn
+            .execute("INSERT INTO meta(key,value) VALUES('dirty_at_head','was/dirty.py')", [])
+            .unwrap();
+        record_git_state(&s.conn, root, "deadbeef", None).unwrap();
+        let dirty: String = s
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='dirty_at_head'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dirty, "was/dirty.py", "status failure leaves the safety net intact");
+        let head: String = s
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='last_indexed_head'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(head, "deadbeef", "head still recorded");
     }
 
     // ---- L2.5 — SQL dialect fixtures --------------------------------------------------------

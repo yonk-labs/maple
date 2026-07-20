@@ -377,12 +377,13 @@ fn walk_pg(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &m
                     out.defs.push(d);
                 }
             }
-            if let Some(enc) = def_name.as_deref() {
+            // body re-parse extracts CALLS — same error-region rule as `func_application`
+            if let (Some(enc), false) = (def_name.as_deref(), in_error) {
                 pg_function_body(node, src, out, enc, ps);
             }
         }
         // `DO $$ ... $$` — anonymous plpgsql block, calls attributed to <module>
-        "DoStmt" => {
+        "DoStmt" if !in_error => {
             if let Some(body) = find_descendant(node, "dollar_quoted_string") {
                 pg_plpgsql_body(body, src, out, enclosing, ps);
             }
@@ -433,7 +434,8 @@ fn pg_function_body(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &st
         if n.kind() == "createfunc_opt_item" {
             if find_child(n, "kw_language").is_some() {
                 if let Some(v) = n.named_child(n.named_child_count().saturating_sub(1)) {
-                    language = Some(text(v, src).to_lowercase());
+                    // `LANGUAGE plpgsql` and the quoted form `LANGUAGE 'plpgsql'` both count
+                    language = Some(text(v, src).trim_matches('\'').to_lowercase());
                 }
             } else if let Some(b) = find_descendant(n, "dollar_quoted_string") {
                 body = Some(b);
@@ -481,15 +483,21 @@ fn pg_plpgsql_body(body: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str
     let Some(blanked) = blank_dollar_delims(text(body, src)) else { return };
     let Some(tree) = ps.pl.parse(&blanked, None) else { return };
     let base = body.start_position().row;
-    let mut stack = vec![tree.root_node()];
-    while let Some(n) = stack.pop() {
+    // the re-parsed plpgsql tree gets the same error-region call suppression as the outer walks:
+    // a body with a structural error (unclosed LOOP/IF) recovers statements INSIDE the ERROR node,
+    // and their membership is not established — extracting them would be a guess.
+    let mut stack = vec![(tree.root_node(), false)];
+    while let Some((n, err)) = stack.pop() {
+        let err = entering_error(n, err);
         if n.kind() == "sql_expression" {
-            pg_sql_fragment(text(n, blanked.as_bytes()), base + n.start_position().row, out, enclosing, ps);
+            if !err {
+                pg_sql_fragment(text(n, blanked.as_bytes()), base + n.start_position().row, out, enclosing, ps);
+            }
             continue;
         }
         let mut c = n.walk();
         for child in n.named_children(&mut c) {
-            stack.push(child);
+            stack.push((child, err));
         }
     }
 }
@@ -693,6 +701,43 @@ SELECT setup_all();
         assert_eq!(d.parent_class.as_deref(), Some("analytics"));
         assert!(p.calls.iter().any(|c| c.name == "compute" && c.kind == "method" && c.enclosing == "rollup"));
         assert!(p.calls.iter().any(|c| c.name == "setup_all" && c.enclosing == "<module>" && c.line == 7));
+    }
+
+    /// Review fix — a plpgsql body with a structural error (unclosed IF) recovers trailing
+    /// statements INSIDE an ERROR node; their calls must not extract (same rule as the outer
+    /// walks). The def itself still extracts.
+    #[test]
+    fn pg_broken_body_suppresses_error_region_calls() {
+        let src = "\
+CREATE FUNCTION broken() RETURNS void AS $$
+BEGIN
+  IF x > 0 THEN
+    real_call(x);
+  another_call(y);
+END;
+$$ LANGUAGE plpgsql;
+";
+        let p = parse_postgres(src).unwrap();
+        assert!(p.defs.iter().any(|d| d.name == "broken"), "def still extracts");
+        assert!(
+            !p.calls.iter().any(|c| c.name == "another_call"),
+            "no calls from the ERROR recovery region: {:?}",
+            p.calls
+        );
+    }
+
+    /// Review nit — the quoted `LANGUAGE 'plpgsql'` form counts as plpgsql too.
+    #[test]
+    fn pg_quoted_language_form() {
+        let src = "\
+CREATE FUNCTION q() RETURNS void AS $$
+BEGIN
+  PERFORM quoted_lang_call();
+END;
+$$ LANGUAGE 'plpgsql';
+";
+        let p = parse_postgres(src).unwrap();
+        assert!(p.calls.iter().any(|c| c.name == "quoted_lang_call" && c.enclosing == "q"));
     }
 
     #[test]
