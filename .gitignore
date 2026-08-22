@@ -16,3 +16,6 @@ spike/**/__pycache__/
 skill-output/
 .claude/
 **/__pycache__/
+
+# bob run artifacts (worktrees, events.jsonl) — this repo is now bob-buildable via its own MCP server
+.bob/

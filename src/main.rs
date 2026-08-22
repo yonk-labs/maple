@@ -7,6 +7,7 @@ mod langs;
 mod mcp;
 mod parser;
 mod store;
+mod thread;
 
 use clap::{Parser as ClapParser, Subcommand};
 use std::fs;
@@ -147,11 +148,25 @@ fn unparsed_status_line(count: usize, files: &[String]) -> Option<String> {
 
 /// W2.3 — render the existing `Bundle` struct as task-ready markdown (`--format prompt`). No
 /// separate assembly path: every field here already exists on `Bundle` for the `json` format.
+/// Markdown fence language for a source file, derived from its extension via
+/// the same registered-language table `parse`/`index` use. Empty (untagged
+/// fence) for a file whose language isn't registered, rather than guessing.
+fn fence_lang(file: &str) -> &'static str {
+    parser::lang_for_path(Path::new(file))
+        .map(|l| l.name)
+        .unwrap_or("")
+}
+
 fn render_prompt(b: &store::Bundle) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# Target: {} ({}:{}-{})\n```python\n{}\n```\n",
-        b.target.fq_name, b.target.file, b.target.start_line, b.target.end_line, b.target.body
+        "# Target: {} ({}:{}-{})\n```{}\n{}\n```\n",
+        b.target.fq_name,
+        b.target.file,
+        b.target.start_line,
+        b.target.end_line,
+        fence_lang(&b.target.file),
+        b.target.body
     ));
 
     out.push_str("## Direct callees\n");
@@ -176,8 +191,13 @@ fn render_prompt(b: &store::Bundle) -> String {
     for c in &b.callers {
         let flag = if c.is_test { "   [TEST]" } else { "" };
         out.push_str(&format!(
-            "### {}:{} in {}(){}\n```python\n{}\n```\n",
-            c.call_site.file, c.call_site.line, c.caller, flag, c.call_site.snippet
+            "### {}:{} in {}(){}\n```{}\n{}\n```\n",
+            c.call_site.file,
+            c.call_site.line,
+            c.caller,
+            flag,
+            fence_lang(&c.call_site.file),
+            c.call_site.snippet
         ));
     }
 
@@ -325,6 +345,22 @@ mod tests {
         assert!(out.contains("## Report"), "report section always rendered (N1)");
         assert!(out.contains("tokens\u{2248}"), "token count included");
         assert!(out.contains("unresolved: [missing]"), "unresolved callees always rendered (N1)");
+    }
+
+    /// Fence language matches the target's actual source language, not a
+    /// hardcoded "python" left over from when maple only parsed Python.
+    #[test]
+    fn render_prompt_fences_use_the_target_files_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("lib.rs"), "pub fn target() -> i32 {\n    1\n}\n").unwrap();
+        let mut s = store::Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        let bundle = s.bundle("target", 16000, 20, 1, 3, &store::ApproxTokenizer).unwrap();
+        let out = render_prompt(&bundle);
+
+        assert!(out.contains("```rust"), "rust source fenced as rust, not python: {out}");
+        assert!(!out.contains("```python"), "no stray python fence for a rust file: {out}");
     }
 
     /// W2.4 — `--snippet-radius` widens/narrows the non-test snippet; `meta.tokenizer` reports the

@@ -1,0 +1,15 @@
+{
+  "name": "maple",
+  "displayName": "Maple",
+  "version": "0.0.1",
+  "description": "An always-fresh code-symbol graph for LLM coding agents: exact caller/callee closures and token-budgeted context bundles, no daemon or stale cache. Exposes enumerate/closure/bundle as MCP tools.",
+  "author": {
+    "name": "yonk-labs",
+    "email": "matt@theyonk.com"
+  },
+  "homepage": "https://github.com/yonk-labs/maple",
+  "repository": "https://github.com/yonk-labs/maple",
+  "license": "Apache-2.0",
+  "keywords": ["code-graph", "symbols", "context", "mcp", "agent"],
+  "mcpServers": "./.mcp.json"
+}

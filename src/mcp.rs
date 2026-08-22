@@ -71,14 +71,14 @@ fn tool_defs() -> Value {
         {
             "name": "enumerate",
             "description": "Count callers/defs for a symbol: N callers across M files, per-resolution counts.",
-            "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}
+            "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "continuation_id": {"type": "string"}}, "required": ["symbol"]}
         },
         {
             "name": "closure",
             "description": "Depth-1 closure of a symbol: target def(s) + direct callers + direct callees.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"symbol": {"type": "string"}, "depth": {"type": "integer"}},
+                "properties": {"symbol": {"type": "string"}, "depth": {"type": "integer"}, "continuation_id": {"type": "string"}},
                 "required": ["symbol"]
             }
         },
@@ -91,7 +91,8 @@ fn tool_defs() -> Value {
                     "symbol": {"type": "string"},
                     "budget": {"type": "integer"},
                     "max_callers": {"type": "integer"},
-                    "format": {"type": "string", "enum": ["json", "prompt"]}
+                    "format": {"type": "string", "enum": ["json", "prompt"]},
+                    "continuation_id": {"type": "string"}
                 },
                 "required": ["symbol"]
             }
@@ -102,6 +103,18 @@ fn tool_defs() -> Value {
 fn tools_call(store: &mut Store, id: Value, params: Value) -> Value {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let cid = args.get("continuation_id").and_then(|c| c.as_str());
+
+    if let Some(cid) = cid {
+        if let Err(e) = crate::thread::read_turns(cid) {
+            return tool_error(id, e.to_string());
+        }
+    }
+
+    let symbol = args
+        .get("symbol")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
     // A1: refresh-first on every call (cheap, ms-scale) so long-lived MCP sessions stay fresh.
     if let Err(e) = store.refresh() {
         return tool_error(id, format!("refresh failed: {e}"));
@@ -112,7 +125,20 @@ fn tools_call(store: &mut Store, id: Value, params: Value) -> Value {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": text}]}})
+            let thread_id: Option<String> = cid
+                .map(|s| s.to_string())
+                .or_else(|| crate::thread::new_thread_id().ok());
+            if let Some(ref tid) = thread_id {
+                if let Some(ref sym) = symbol {
+                    let _ = crate::thread::append_turn(tid, "user", &format!("maple.{name}"), sym, None);
+                }
+                let _ = crate::thread::append_turn(tid, "assistant", &format!("maple.{name}"), &text, None);
+            }
+            let mut result = json!({"content": [{"type": "text", "text": text}]});
+            if let Some(ref tid) = thread_id {
+                result["continuation_id"] = Value::String(tid.clone());
+            }
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
         }
         Err(e) => tool_error(id, e.to_string()), // symbol-not-found etc. -> tool error, not a crash
     }
@@ -221,5 +247,40 @@ mod tests {
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"bundle","arguments":{"symbol":"does_not_exist"}}}),
         );
         assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[test]
+    fn continuation_id_round_trips() {
+        crate::thread::test_support::with_temp_dir(|_td| {
+            let (_tmp, mut s) = fixture();
+
+            // First call: bundle on target with no continuation_id
+            let resp = handle_request(
+                &mut s,
+                json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"bundle","arguments":{"symbol":"target"}}}),
+            );
+            let first_cid = resp["result"]["continuation_id"].as_str().unwrap();
+            assert!(!first_cid.is_empty(), "first response includes a continuation_id");
+
+            // Second call: enumerate on target with that same continuation_id
+            let resp2 = handle_request(
+                &mut s,
+                json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"enumerate","arguments":{"symbol":"target","continuation_id": first_cid}}}),
+            );
+            assert!(resp2["result"]["isError"].is_null(), "second call with valid continuation_id succeeds");
+            assert_eq!(resp2["result"]["continuation_id"].as_str().unwrap(), first_cid, "same continuation_id returned");
+        });
+    }
+
+    #[test]
+    fn unknown_continuation_id_is_tool_error() {
+        crate::thread::test_support::with_temp_dir(|_td| {
+            let (_tmp, mut s) = fixture();
+            let resp = handle_request(
+                &mut s,
+                json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"enumerate","arguments":{"symbol":"target","continuation_id":"does-not-exist"}}}),
+            );
+            assert_eq!(resp["result"]["isError"], true, "unknown continuation_id is a tool error");
+        });
     }
 }
