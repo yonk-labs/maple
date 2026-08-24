@@ -180,15 +180,6 @@ fn fence_lang(file: &str) -> &'static str {
 
 /// W2.3 — render the existing `Bundle` struct as task-ready markdown (`--format prompt`). No
 /// separate assembly path: every field here already exists on `Bundle` for the `json` format.
-/// Markdown fence language for a source file, derived from its extension via
-/// the same registered-language table `parse`/`index` use. Empty (untagged
-/// fence) for a file whose language isn't registered, rather than guessing.
-fn fence_lang(file: &str) -> &'static str {
-    parser::lang_for_path(Path::new(file))
-        .map(|l| l.name)
-        .unwrap_or("")
-}
-
 fn render_prompt(b: &store::Bundle) -> String {
     let mut out = String::new();
     out.push_str(&format!(
