@@ -52,7 +52,8 @@ for R in maple bob abe hector; do
   if [ -d "$SRC/$R/.git" ]; then git -C "$SRC/$R" pull -q --ff-only || true
   else git clone -q "https://github.com/yonk-labs/$R.git" "$SRC/$R"; fi
   (cd "$SRC/$R" && cargo build --release -q)
-  cp "$SRC/$R/target/release/$R" "$BIN/$R"
+  # rename is atomic and works even if the old binary is running (cp fails with ETXTBSY)
+  cp "$SRC/$R/target/release/$R" "$BIN/$R.new" && mv -f "$BIN/$R.new" "$BIN/$R"
 done
 
 # 4) goose (block/goose builder CLI) — official binary
