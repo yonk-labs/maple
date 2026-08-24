@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -1679,6 +1679,50 @@ fn strip_ab_prefix(p: &str) -> Option<String> {
     Some(p.strip_prefix("a/").or_else(|| p.strip_prefix("b/")).unwrap_or(p).to_string())
 }
 
+/// L3.3 — resolve a column reference.
+///
+/// `receiver_class` carries the candidate table scope built at walk time: a single table name for
+/// a qualified reference or a direct-target statement (INSERT, plain UPDATE), or a `\x1f`-delimited
+/// set of every table in a multi-table FROM/JOIN scope for an unqualified reference.
+///
+/// The result is exact when exactly one table in that set defines a `kind='column'` symbol named
+/// `name`. It is ambiguous when two or more do, since which one is meant is never guessed. It is
+/// unresolved when none do, or when no scope was known at extraction time (`receiver_class` is
+/// `None`) — an honest omission from the walk (e.g. dynamic SQL), not something to guess at here.
+///
+/// There are no fallback tiers. `resolve_call`'s function-name resolution has a "lone candidate
+/// anywhere in the repo" tier; columns deliberately have no equivalent, since a column name
+/// colliding with an unrelated table's column of the same name is common and must not resolve just
+/// because it happens to be the only match repo-wide.
+fn resolve_column_ref(
+    conn: &Connection,
+    name: &str,
+    receiver_class: Option<&str>,
+    lang: &str,
+) -> Result<(Option<i64>, &'static str)> {
+    let Some(scope) = receiver_class else {
+        return Ok((None, "unresolved"));
+    };
+    let tables: Vec<&str> = scope.split('\u{1f}').collect();
+    let placeholders = vec!["?"; tables.len()].join(",");
+    let sql = format!(
+        "SELECT id FROM symbols WHERE name=? AND lang=? AND kind='column' AND parent_class IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let bind_params: Vec<&str> = std::iter::once(name)
+        .chain(std::iter::once(lang))
+        .chain(tables.iter().copied())
+        .collect();
+    let ids: Vec<i64> = stmt
+        .query_map(params_from_iter(bind_params.iter()), |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(match ids.len() {
+        0 => (None, "unresolved"),
+        1 => (Some(ids[0]), "exact"),
+        _ => (None, "ambiguous"),
+    })
+}
+
 /// Resolve a (post-alias) call against the symbols table: (callee_symbol, label).
 /// The label domain is exactly {exact, ambiguous, unresolved} — never a score (N2).
 ///
@@ -1704,6 +1748,17 @@ fn resolve_call(
     call_site_file: &str,
     lang: &str,
 ) -> Result<(Option<i64>, &'static str)> {
+    // L3.3 — column references dispatch to a wholly separate resolver, BEFORE any of the
+    // function-call logic below runs. Two reasons this can't share the rest of the function: (1)
+    // the universal "lone same-named candidate -> exact" fallback at the bottom would produce a
+    // false-exact match for a column whose name happens to collide with an unrelated procedure's
+    // name; (2) `receiver_class` here carries a SET of candidate tables (delimited, see
+    // `scope_receiver` in langs_sql.rs), not a single hint the way "method" resolution uses it.
+    // No existing language emits "read"/"write" as a call_kind, so this dispatch leaves every
+    // other resolution path byte-identical by construction, not just unbroken by the test suite.
+    if call_kind == "read" || call_kind == "write" {
+        return resolve_column_ref(conn, name, receiver_class, lang);
+    }
     let mut stmt =
         conn.prepare_cached("SELECT id, parent_class, file FROM symbols WHERE name=?1 AND lang=?2")?;
     let cands: Vec<(i64, Option<String>, String)> = stmt
@@ -3715,6 +3770,116 @@ mod tests {
         let reopened_syms: i64 =
             reopened.conn.query_row("SELECT value FROM meta WHERE key='sql_columns'", [], |r| r.get::<_, String>(0)).unwrap().parse::<i64>().unwrap();
         assert_eq!(reopened_syms, 1, "sql_columns=on persisted across Store::open");
+    }
+
+    /// L3.3 — end-to-end: a column read/written in a T-SQL procedure body resolves exact,
+    /// cross-file, to the `column` symbol Phase A extracted from CREATE TABLE. This is the actual
+    /// payoff of the whole wave: "if I change this column, what's impacted" now has a real answer.
+    #[test]
+    fn l3_column_read_resolves_exact_cross_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Status VARCHAR(20), Id INT);\n").unwrap();
+        fs::write(
+            root.join("procs.sql"),
+            "CREATE PROCEDURE CloseOrder\nAS\nBEGIN\n  UPDATE Orders SET Status = 'closed' WHERE Id = 5;\nEND\nGO\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        s.set_sql_columns(true).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(
+            resolved(&s, "status", "closeorder"),
+            ("exact".into(), Some("schema.sql".into())),
+            "write, cross-file, case-folded"
+        );
+        assert_eq!(edge_kinds(&s, "status", "closeorder").1, "write");
+        assert_eq!(
+            resolved(&s, "id", "closeorder"),
+            ("exact".into(), Some("schema.sql".into())),
+            "read (WHERE clause)"
+        );
+        assert_eq!(edge_kinds(&s, "id", "closeorder").1, "read");
+    }
+
+    /// L3.3 — an unqualified column read across a JOIN, where two tables in scope both define a
+    /// column with that name, resolves ambiguous — never guessed which table it means.
+    #[test]
+    fn l3_column_read_ambiguous_across_two_tables_sharing_a_column_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("schema.sql"),
+            "CREATE TABLE Orders (Id INT, Status VARCHAR(20));\nCREATE TABLE Shipments (Id INT, Status VARCHAR(20));\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("procs.sql"),
+            "CREATE PROCEDURE ReportStatus\nAS\nBEGIN\n  SELECT Status FROM Orders o JOIN Shipments s ON o.Id = s.Id;\nEND\nGO\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        s.set_sql_columns(true).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "status", "reportstatus").0, "ambiguous");
+        // Qualified refs in the JOIN's ON clause are unaffected — each resolves to its own table.
+        let id_edges: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE callee_name='id' AND kind='exact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id_edges, 2, "o.Id -> Orders.Id and s.Id -> Shipments.Id, both exact");
+    }
+
+    /// L3.3 — the actual origin question this wave exists to answer: `impact --diff` on a changed
+    /// column surfaces every reader/writer of it, across files, via the SAME command that already
+    /// works for functions — no new query surface, per the wave's key design decision.
+    #[test]
+    fn l3_impact_diff_surfaces_column_readers_and_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Id INT, Status VARCHAR(20));\n").unwrap();
+        fs::write(
+            root.join("reader.sql"),
+            "CREATE PROCEDURE ReadIt\nAS\nBEGIN\n  SELECT Status FROM Orders WHERE Id = 1;\nEND\nGO\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("writer.sql"),
+            "CREATE PROCEDURE WriteIt\nAS\nBEGIN\n  UPDATE Orders SET Status = 'x' WHERE Id = 1;\nEND\nGO\n",
+        )
+        .unwrap();
+        git(root, &["init"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "base"]);
+
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        s.set_sql_columns(true).unwrap();
+        s.index_repo(root).unwrap();
+
+        // Simulate "I changed this column": rewrite schema.sql's Status definition.
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Id INT, Status VARCHAR(50));\n").unwrap();
+        let diff = run_git_diff(root.to_str().unwrap(), Some("HEAD"), false).unwrap();
+        let (changed, deleted) = parse_diff(&diff);
+        assert!(deleted.is_empty());
+        let impact = s.impact(&changed, &deleted).unwrap();
+        let status_sym = impact
+            .changed_symbols
+            .iter()
+            .find(|sym| sym.fq_name.to_lowercase().ends_with("status"))
+            .unwrap_or_else(|| panic!("no changed symbol for Status in {:?}", impact.changed_symbols));
+        assert_eq!(status_sym.kind, "column");
+        let callers: Vec<&str> = status_sym.callers.iter().map(|c| c.caller.as_str()).collect();
+        assert!(callers.iter().any(|c| c.eq_ignore_ascii_case("ReadIt")), "{callers:?}");
+        assert!(callers.iter().any(|c| c.eq_ignore_ascii_case("WriteIt")), "{callers:?}");
     }
 
     /// L2.5 Oracle — `.pks`/`.pkb` need NO dialect flag: the spec's decl emits no def, the body's
