@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -131,7 +131,13 @@ struct FileParse {
 /// T13 — read + parse `path` (relative name `rel`); pure CPU work, safe to run on a rayon thread.
 /// L1.1: the walk is dispatched by extension via the registry — `path` is only ever a file the
 /// registered-extension walker yielded. L2.1: `.sql` dispatch needs the store's dialect.
-fn parse_one_file(path: &Path, rel: String, sql: Option<crate::parser::SqlDialect>) -> FileParse {
+fn parse_one_file(
+    path: &Path,
+    rel: String,
+    sql: Option<crate::parser::SqlDialect>,
+    sql_columns: bool,
+    sql_cte: bool,
+) -> FileParse {
     let lang = crate::parser::lang_for_path(path, sql).expect("walker only yields registered extensions");
     let outcome = match std::fs::read(path) {
         Err(e) => ParseOutcome::Unreadable(format!("unreadable: {e}")),
@@ -144,7 +150,17 @@ fn parse_one_file(path: &Path, rel: String, sql: Option<crate::parser::SqlDialec
             let hash = hash_bytes(&bytes);
             match (lang.parse)(&src) {
                 Err(e) => ParseOutcome::ParseErr { hash, err: e.to_string() },
-                Ok(parsed) => {
+                Ok(mut parsed) => {
+                    // L3 — table/column defs are opt-in (see `Store::sql_columns` doc). Filtered
+                    // here, one layer above the walk, so the walk functions themselves (and their
+                    // existing unit tests) stay unconditional — this is a storage-policy gate, not
+                    // a parsing capability gate.
+                    if !sql_columns {
+                        parsed.defs.retain(|d| d.kind != "table" && d.kind != "column");
+                    }
+                    if sql_cte {
+                        apply_cte_columns(&mut parsed);
+                    }
                     // T15: tree-sitter is error-tolerant (rarely returns Err above) — a non-empty
                     // file that parses to zero defs+calls+imports is the actually-triggerable
                     // signal that something's wrong (garbage/binary content, or a source shape the
@@ -161,6 +177,30 @@ fn parse_one_file(path: &Path, rel: String, sql: Option<crate::parser::SqlDialec
         }
     };
     FileParse { rel, lang: lang.name, outcome }
+}
+
+/// L3.4 (CTE lineage) — gated behind `--with-sql-cte` (see `Store::sql_cte`). For every call whose
+/// `receiver_class` is a single (non-`\x1f`-delimited) name tracked in `parsed.cte_columns`,
+/// rewrite it to the REAL table/column the CTE actually re-projects, so it resolves against real
+/// schema exactly like a direct reference would — instead of an always-empty CTE-name
+/// `parent_class`. One layer above the walk (same "storage-policy gate, not a parsing capability
+/// gate" as `sql_columns`'s defs filter above): the walk always exports `cte_columns`
+/// unconditionally, this is the only place it's ever applied.
+pub(crate) fn apply_cte_columns(parsed: &mut crate::parser::ParsedFile) {
+    if parsed.cte_columns.is_empty() {
+        return;
+    }
+    let cte_columns = parsed.cte_columns.clone();
+    for c in parsed.calls.iter_mut() {
+        let Some(rc) = &c.receiver_class else { continue };
+        if rc.contains('\u{1f}') {
+            continue; // multi-table ambiguous scope — v1 doesn't expand a CTE inside a candidate set
+        }
+        if let Some((real_table, real_col)) = cte_columns.get(rc).and_then(|m| m.get(&c.name)) {
+            c.name = real_col.clone();
+            c.receiver_class = Some(real_table.clone());
+        }
+    }
 }
 
 // ---- read-side query results (S1.4) ----------------------------------------
@@ -436,6 +476,19 @@ pub struct Store {
     /// `index --sql-dialect`). None -> `.sql` files are not indexed; Oracle-only extensions
     /// (.pks/.pkb/...) are always PL/SQL regardless.
     sql_dialect: Option<crate::parser::SqlDialect>,
+    /// L3 (Wave L3, Phase A) — table/column def extraction from CREATE TABLE, meta key
+    /// `sql_columns`, set by `index --sql-columns`. Off by default: this is new, unvalidated
+    /// behavior — shipping it dark until proven out on real corpora, not on by default the moment
+    /// the walk code lands. False -> CREATE TABLE parses (dialect permitting) but table/column defs
+    /// are filtered out before storage, restoring the pre-Wave-L3 "DDL-only file has zero defs"
+    /// behavior exactly.
+    sql_columns: bool,
+    /// L3.4 (CTE lineage) — meta key `sql_cte`, set by `index --with-sql-cte`. Off by default:
+    /// covers T-SQL, Postgres, and PL/SQL; shipped dark until proven out. False -> the walk still
+    /// exports `ParsedFile::cte_columns` (unconditional, see its doc comment) but `parse_one_file`
+    /// never applies it, so a CTE-scoped read resolves exactly as it did before this feature
+    /// existed (unresolved, its receiver_class is a name no `symbols` row ever has).
+    sql_cte: bool,
 }
 
 impl Store {
@@ -486,7 +539,17 @@ impl Store {
             .query_row("SELECT value FROM meta WHERE key='sql_dialect'", [], |r| r.get::<_, String>(0))
             .optional()?
             .and_then(|v| crate::parser::SqlDialect::parse(&v).ok());
-        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect })
+        let sql_columns = conn
+            .query_row("SELECT value FROM meta WHERE key='sql_columns'", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let sql_cte = conn
+            .query_row("SELECT value FROM meta WHERE key='sql_cte'", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect, sql_columns, sql_cte })
     }
 
     /// L2.1 — persist the repo's `.sql` dialect so refresh/queries (and seeded copies) inherit it.
@@ -497,6 +560,31 @@ impl Store {
             [d.as_str()],
         )?;
         self.sql_dialect = Some(d);
+        Ok(())
+    }
+
+    /// L3 — persist whether table/column defs from CREATE TABLE are kept, so refresh inherits it
+    /// the same way `set_sql_dialect` does. Off by default (see the `sql_columns` field doc).
+    pub fn set_sql_columns(&mut self, on: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('sql_columns',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if on { "1" } else { "0" }],
+        )?;
+        self.sql_columns = on;
+        Ok(())
+    }
+
+    /// L3.4 (CTE lineage) — persist whether CTE-scoped reads are rewritten to their real
+    /// underlying table/column, so refresh inherits it the same way `set_sql_columns` does. Off by
+    /// default (see the `sql_cte` field doc).
+    pub fn set_sql_cte(&mut self, on: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('sql_cte',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if on { "1" } else { "0" }],
+        )?;
+        self.sql_cte = on;
         Ok(())
     }
 
@@ -513,6 +601,8 @@ impl Store {
     /// which could wipe the graph and then be interrupted before the rebuild finished.
     pub fn index_repo(&mut self, root: &Path) -> Result<IndexStats> {
         let sql = self.sql_dialect;
+        let sql_columns = self.sql_columns;
+        let sql_cte = self.sql_cte;
         let files = source_files(root, sql);
         let mut st = IndexStats::default();
 
@@ -523,7 +613,7 @@ impl Store {
             .par_iter()
             .map(|path| {
                 let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-                parse_one_file(path, rel, sql)
+                parse_one_file(path, rel, sql, sql_columns, sql_cte)
             })
             .collect();
 
@@ -1642,6 +1732,50 @@ fn strip_ab_prefix(p: &str) -> Option<String> {
     Some(p.strip_prefix("a/").or_else(|| p.strip_prefix("b/")).unwrap_or(p).to_string())
 }
 
+/// L3.3 — resolve a column reference.
+///
+/// `receiver_class` carries the candidate table scope built at walk time: a single table name for
+/// a qualified reference or a direct-target statement (INSERT, plain UPDATE), or a `\x1f`-delimited
+/// set of every table in a multi-table FROM/JOIN scope for an unqualified reference.
+///
+/// The result is exact when exactly one table in that set defines a `kind='column'` symbol named
+/// `name`. It is ambiguous when two or more do, since which one is meant is never guessed. It is
+/// unresolved when none do, or when no scope was known at extraction time (`receiver_class` is
+/// `None`) — an honest omission from the walk (e.g. dynamic SQL), not something to guess at here.
+///
+/// There are no fallback tiers. `resolve_call`'s function-name resolution has a "lone candidate
+/// anywhere in the repo" tier; columns deliberately have no equivalent, since a column name
+/// colliding with an unrelated table's column of the same name is common and must not resolve just
+/// because it happens to be the only match repo-wide.
+fn resolve_column_ref(
+    conn: &Connection,
+    name: &str,
+    receiver_class: Option<&str>,
+    lang: &str,
+) -> Result<(Option<i64>, &'static str)> {
+    let Some(scope) = receiver_class else {
+        return Ok((None, "unresolved"));
+    };
+    let tables: Vec<&str> = scope.split('\u{1f}').collect();
+    let placeholders = vec!["?"; tables.len()].join(",");
+    let sql = format!(
+        "SELECT id FROM symbols WHERE name=? AND lang=? AND kind='column' AND parent_class IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let bind_params: Vec<&str> = std::iter::once(name)
+        .chain(std::iter::once(lang))
+        .chain(tables.iter().copied())
+        .collect();
+    let ids: Vec<i64> = stmt
+        .query_map(params_from_iter(bind_params.iter()), |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(match ids.len() {
+        0 => (None, "unresolved"),
+        1 => (Some(ids[0]), "exact"),
+        _ => (None, "ambiguous"),
+    })
+}
+
 /// Resolve a (post-alias) call against the symbols table: (callee_symbol, label).
 /// The label domain is exactly {exact, ambiguous, unresolved} — never a score (N2).
 ///
@@ -1667,6 +1801,17 @@ fn resolve_call(
     call_site_file: &str,
     lang: &str,
 ) -> Result<(Option<i64>, &'static str)> {
+    // L3.3 — column references dispatch to a wholly separate resolver, BEFORE any of the
+    // function-call logic below runs. Two reasons this can't share the rest of the function: (1)
+    // the universal "lone same-named candidate -> exact" fallback at the bottom would produce a
+    // false-exact match for a column whose name happens to collide with an unrelated procedure's
+    // name; (2) `receiver_class` here carries a SET of candidate tables (delimited, see
+    // `scope_receiver` in langs_sql.rs), not a single hint the way "method" resolution uses it.
+    // No existing language emits "read"/"write" as a call_kind, so this dispatch leaves every
+    // other resolution path byte-identical by construction, not just unbroken by the test suite.
+    if call_kind == "read" || call_kind == "write" {
+        return resolve_column_ref(conn, name, receiver_class, lang);
+    }
     let mut stmt =
         conn.prepare_cached("SELECT id, parent_class, file FROM symbols WHERE name=?1 AND lang=?2")?;
     let cands: Vec<(i64, Option<String>, String)> = stmt
@@ -3612,7 +3757,9 @@ mod tests {
 
     /// L2.5 PostgreSQL — `--sql-dialect=postgres`: a plpgsql body's PERFORM resolves exact
     /// cross-file; schema-qualified call in a body lands kind `method`; DDL-only file is neither
-    /// suspect nor a def source.
+    /// suspect nor a def source. L3.2 added table/column extraction from CREATE TABLE, but it's
+    /// opt-in (`--sql-columns`, off by default — see `l3_sql_columns_is_opt_in`) — this test
+    /// doesn't set it, so schema.sql's behavior here is unchanged from before Wave L3.
     #[test]
     fn l2_postgres_fixture_pair() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3641,7 +3788,196 @@ mod tests {
         assert!(s.parse_failures().unwrap().is_empty(), "DDL-only schema.sql is not suspect");
         let ddl_syms: i64 =
             s.conn.query_row("SELECT COUNT(*) FROM symbols WHERE file='schema.sql'", [], |r| r.get(0)).unwrap();
-        assert_eq!(ddl_syms, 0);
+        assert_eq!(ddl_syms, 0, "sql_columns off by default — DDL-only file contributes no defs");
+    }
+
+    /// L3 — table/column extraction from CREATE TABLE is opt-in, off by default: the same repo
+    /// indexed once without `--sql-columns` and once with it must show the flag, and only the
+    /// flag, controlling whether schema.sql contributes any defs.
+    #[test]
+    fn l3_sql_columns_is_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE orders (id int primary key);\n").unwrap();
+
+        let mut off = Store::open(root).unwrap();
+        off.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        off.index_repo(root).unwrap();
+        let off_syms: i64 =
+            off.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap();
+        assert_eq!(off_syms, 0, "default: no table/column defs");
+
+        let mut on = Store::open(root).unwrap();
+        on.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        on.set_sql_columns(true).unwrap();
+        on.index_repo(root).unwrap();
+        let on_syms: i64 =
+            on.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap();
+        assert_eq!(on_syms, 2, "opted in: table `orders` + column `id`");
+        assert_eq!(parent_of(&on, "id").as_deref(), Some("orders"));
+
+        // Persistence: re-opening the store (simulating a later `refresh`/query) without passing
+        // --sql-columns again must still remember the repo opted in — same contract as
+        // --sql-dialect.
+        let reopened = Store::open(root).unwrap();
+        let reopened_syms: i64 =
+            reopened.conn.query_row("SELECT value FROM meta WHERE key='sql_columns'", [], |r| r.get::<_, String>(0)).unwrap().parse::<i64>().unwrap();
+        assert_eq!(reopened_syms, 1, "sql_columns=on persisted across Store::open");
+    }
+
+    /// L3.3 — end-to-end: a column read/written in a T-SQL procedure body resolves exact,
+    /// cross-file, to the `column` symbol Phase A extracted from CREATE TABLE. This is the actual
+    /// payoff of the whole wave: "if I change this column, what's impacted" now has a real answer.
+    #[test]
+    fn l3_column_read_resolves_exact_cross_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Status VARCHAR(20), Id INT);\n").unwrap();
+        fs::write(
+            root.join("procs.sql"),
+            "CREATE PROCEDURE CloseOrder\nAS\nBEGIN\n  UPDATE Orders SET Status = 'closed' WHERE Id = 5;\nEND\nGO\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        s.set_sql_columns(true).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(
+            resolved(&s, "status", "closeorder"),
+            ("exact".into(), Some("schema.sql".into())),
+            "write, cross-file, case-folded"
+        );
+        assert_eq!(edge_kinds(&s, "status", "closeorder").1, "write");
+        assert_eq!(
+            resolved(&s, "id", "closeorder"),
+            ("exact".into(), Some("schema.sql".into())),
+            "read (WHERE clause)"
+        );
+        assert_eq!(edge_kinds(&s, "id", "closeorder").1, "read");
+    }
+
+    /// L3.3 — an unqualified column read across a JOIN, where two tables in scope both define a
+    /// column with that name, resolves ambiguous — never guessed which table it means.
+    #[test]
+    fn l3_column_read_ambiguous_across_two_tables_sharing_a_column_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("schema.sql"),
+            "CREATE TABLE Orders (Id INT, Status VARCHAR(20));\nCREATE TABLE Shipments (Id INT, Status VARCHAR(20));\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("procs.sql"),
+            "CREATE PROCEDURE ReportStatus\nAS\nBEGIN\n  SELECT Status FROM Orders o JOIN Shipments s ON o.Id = s.Id;\nEND\nGO\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        s.set_sql_columns(true).unwrap();
+        s.index_repo(root).unwrap();
+
+        assert_eq!(resolved(&s, "status", "reportstatus").0, "ambiguous");
+        // Qualified refs in the JOIN's ON clause are unaffected — each resolves to its own table.
+        let id_edges: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE callee_name='id' AND kind='exact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id_edges, 2, "o.Id -> Orders.Id and s.Id -> Shipments.Id, both exact");
+    }
+
+    /// L3.4 (CTE lineage pilot) — a T-SQL proc reading a column through a CTE alias resolves
+    /// `unresolved` by default (the CTE name never matches a real `parent_class`, exactly the
+    /// pre-feature behavior) and `exact` against the CTE's real underlying table once
+    /// `--with-sql-cte` is on — the actual payoff: `impact --diff` on `Orders.Status` now also
+    /// finds readers that only ever go through a CTE.
+    #[test]
+    fn l3_4_sql_cte_is_opt_in_and_resolves_through_the_real_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Status VARCHAR(20), Id INT);\n").unwrap();
+        fs::write(
+            root.join("procs.sql"),
+            "CREATE PROCEDURE RecentStatus\nAS\nBEGIN\n  WITH Recent AS (SELECT Status, Id FROM Orders)\n  SELECT r.Status FROM Recent r WHERE r.Id = 5;\nEND\nGO\n",
+        )
+        .unwrap();
+
+        let mut off = Store::open(root).unwrap();
+        off.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        off.set_sql_columns(true).unwrap();
+        off.index_repo(root).unwrap();
+        assert_eq!(resolved(&off, "status", "recentstatus").0, "unresolved", "sql_cte off by default");
+
+        let mut on = Store::open(root).unwrap();
+        on.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        on.set_sql_columns(true).unwrap();
+        on.set_sql_cte(true).unwrap();
+        on.index_repo(root).unwrap();
+        assert_eq!(
+            resolved(&on, "status", "recentstatus"),
+            ("exact".into(), Some("schema.sql".into())),
+            "r.Status -> Recent's real underlying Orders.Status"
+        );
+        assert_eq!(edge_kinds(&on, "status", "recentstatus").1, "read");
+
+        // Persistence: same contract as sql_columns.
+        let reopened = Store::open(root).unwrap();
+        let v: i64 = reopened
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='sql_cte'", [], |r| r.get::<_, String>(0))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(v, 1, "sql_cte=on persisted across Store::open");
+    }
+
+    /// L3.3 — the actual origin question this wave exists to answer: `impact --diff` on a changed
+    /// column surfaces every reader/writer of it, across files, via the SAME command that already
+    /// works for functions — no new query surface, per the wave's key design decision.
+    #[test]
+    fn l3_impact_diff_surfaces_column_readers_and_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Id INT, Status VARCHAR(20));\n").unwrap();
+        fs::write(
+            root.join("reader.sql"),
+            "CREATE PROCEDURE ReadIt\nAS\nBEGIN\n  SELECT Status FROM Orders WHERE Id = 1;\nEND\nGO\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("writer.sql"),
+            "CREATE PROCEDURE WriteIt\nAS\nBEGIN\n  UPDATE Orders SET Status = 'x' WHERE Id = 1;\nEND\nGO\n",
+        )
+        .unwrap();
+        git(root, &["init"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "base"]);
+
+        let mut s = Store::open(root).unwrap();
+        s.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        s.set_sql_columns(true).unwrap();
+        s.index_repo(root).unwrap();
+
+        // Simulate "I changed this column": rewrite schema.sql's Status definition.
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Id INT, Status VARCHAR(50));\n").unwrap();
+        let diff = run_git_diff(root.to_str().unwrap(), Some("HEAD"), false).unwrap();
+        let (changed, deleted) = parse_diff(&diff);
+        assert!(deleted.is_empty());
+        let impact = s.impact(&changed, &deleted).unwrap();
+        let status_sym = impact
+            .changed_symbols
+            .iter()
+            .find(|sym| sym.fq_name.to_lowercase().ends_with("status"))
+            .unwrap_or_else(|| panic!("no changed symbol for Status in {:?}", impact.changed_symbols));
+        assert_eq!(status_sym.kind, "column");
+        let callers: Vec<&str> = status_sym.callers.iter().map(|c| c.caller.as_str()).collect();
+        assert!(callers.iter().any(|c| c.eq_ignore_ascii_case("ReadIt")), "{callers:?}");
+        assert!(callers.iter().any(|c| c.eq_ignore_ascii_case("WriteIt")), "{callers:?}");
     }
 
     /// L2.5 Oracle — `.pks`/`.pkb` need NO dialect flag: the spec's decl emits no def, the body's

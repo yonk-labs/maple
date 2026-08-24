@@ -36,6 +36,15 @@ enum Cmd {
         /// name the dialect). Oracle-only extensions (.pks/.pkb/.prc/.fnc/.trg/.pls) never need it.
         #[arg(long)]
         sql_dialect: Option<String>,
+        /// L3 (Wave L3, Phase A) — also extract table/column defs from CREATE TABLE. Off by
+        /// default: new, unvalidated behavior, shipped dark until proven out on real corpora.
+        #[arg(long, default_value_t = false)]
+        sql_columns: bool,
+        /// L3.4 (CTE lineage: T-SQL, Postgres, PL/SQL) — resolve a CTE-scoped column read against the
+        /// real table/column it re-projects, instead of leaving it unresolved. Off by default;
+        /// implies --sql-columns (a CTE read resolves against real column defs, which need it on).
+        #[arg(long, default_value_t = false)]
+        with_sql_cte: bool,
     },
     /// Cold full index of a repo into <repo>/.maple/graph.db.
     Index {
@@ -44,6 +53,17 @@ enum Cmd {
         /// so refresh and queries inherit it; without it `.sql` files are not indexed.
         #[arg(long)]
         sql_dialect: Option<String>,
+        /// L3 (Wave L3, Phase A) — also extract table/column defs from CREATE TABLE. Off by
+        /// default: new, unvalidated behavior, shipped dark until proven out on real corpora.
+        /// Persisted in the store, so refresh inherits it the same way --sql-dialect does.
+        #[arg(long, default_value_t = false)]
+        sql_columns: bool,
+        /// L3.4 (CTE lineage: T-SQL, Postgres, PL/SQL) — resolve a CTE-scoped column read against the
+        /// real table/column it re-projects, instead of leaving it unresolved. Off by default,
+        /// persisted like --sql-columns; implies --sql-columns (a CTE read resolves against real
+        /// column defs, which need it on).
+        #[arg(long, default_value_t = false)]
+        with_sql_cte: bool,
     },
     /// Read counts from an existing store without parsing (no reindex, just reports what's there).
     Status { repo: String },
@@ -252,18 +272,35 @@ fn refresh_note(s: &mut store::Store) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Parse { path, sql_dialect } => {
+        Cmd::Parse { path, sql_dialect, sql_columns, with_sql_cte } => {
             let dialect = sql_dialect.as_deref().map(parser::SqlDialect::parse).transpose()?;
             let lang = require_supported(&path, dialect)?;
             let src = fs::read_to_string(&path)?;
-            let parsed = (lang.parse)(&src)?;
+            let mut parsed = (lang.parse)(&src)?;
+            if !(sql_columns || with_sql_cte) {
+                parsed.defs.retain(|d| d.kind != "table" && d.kind != "column");
+            }
+            if with_sql_cte {
+                store::apply_cte_columns(&mut parsed);
+            }
             println!("{}", serde_json::to_string_pretty(&parsed)?);
         }
-        Cmd::Index { repo, sql_dialect } => {
+        Cmd::Index { repo, sql_dialect, sql_columns, with_sql_cte } => {
             let root = Path::new(&repo);
             let mut s = store::Store::open(root)?;
             if let Some(d) = sql_dialect.as_deref() {
                 s.set_sql_dialect(parser::SqlDialect::parse(d)?)?;
+            }
+            // Only ever turns ON here, mirroring --sql-dialect's "explicit value wins, omission
+            // preserves whatever was persisted" behavior — a bare bool flag can't distinguish
+            // "not passed" from "explicitly false" the way sql_dialect's Option<String> can, so
+            // there's currently no CLI path back to off once a repo has opted in; delete .maple
+            // and reindex if that's ever needed.
+            if sql_columns || with_sql_cte {
+                s.set_sql_columns(true)?;
+            }
+            if with_sql_cte {
+                s.set_sql_cte(true)?;
             }
             let st = s.index_repo(root)?;
             println!(
