@@ -41,12 +41,16 @@ already have. Re-run any time to update everything.
 
 **Just maple:**
 
-Requires a stable Rust toolchain (any recent stable `rustc`/`cargo` — no nightly features used).
+Requires a stable Rust toolchain (any recent stable `rustc`/`cargo` — no nightly features used)
+and, since v0.3.6, a C compiler (`cc`/`gcc`/`clang`) — Oracle PL/SQL support vendors a C scanner,
+compiled via `build.rs`.
 
 ```bash
 git clone https://github.com/yonk-labs/maple
 cd maple
-cargo install --path .
+./install.sh            # builds release + installs to ~/.local/bin, checks prerequisites first
+# or
+cargo install --path .  # installs to ~/.cargo/bin
 ```
 
 Once the repo is public, you can skip the clone:
