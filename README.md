@@ -208,11 +208,13 @@ stdio — no SDK dependency. Point any MCP-capable client at it:
 ```
 
 maple also ships as a Claude Code plugin: `.claude-plugin/plugin.json` (name `maple`) plus
-`.mcp.json` wire the same `maple mcp .` server into the manifest shape bob and abe use for
-one-command installs (`/plugin marketplace add yonk-labs/bob` + `/plugin install bob@yonk-labs`,
-see bob's README) — but maple's repo doesn't yet carry its own `.claude-plugin/marketplace.json`
-the way bob's does, so that two-step marketplace install isn't wired up here yet. The manual
-client config above is still the way to point a client at it today.
+`.mcp.json` wire the same `maple mcp .` server into the manifest shape bob and abe use, and
+`.claude-plugin/marketplace.json` makes it a one-command install like the others:
+
+```
+/plugin marketplace add yonk-labs/maple
+/plugin install maple@yonk-labs
+```
 
 It exposes 3 tools, each refreshing the graph first so a long-lived session self-heals:
 
