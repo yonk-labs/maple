@@ -40,7 +40,7 @@ enum Cmd {
         /// default: new, unvalidated behavior, shipped dark until proven out on real corpora.
         #[arg(long, default_value_t = false)]
         sql_columns: bool,
-        /// L3.4 (CTE lineage, pilot: T-SQL only) — resolve a CTE-scoped column read against the
+        /// L3.4 (CTE lineage: T-SQL, Postgres, PL/SQL) — resolve a CTE-scoped column read against the
         /// real table/column it re-projects, instead of leaving it unresolved. Off by default;
         /// implies --sql-columns (a CTE read resolves against real column defs, which need it on).
         #[arg(long, default_value_t = false)]
@@ -58,7 +58,7 @@ enum Cmd {
         /// Persisted in the store, so refresh inherits it the same way --sql-dialect does.
         #[arg(long, default_value_t = false)]
         sql_columns: bool,
-        /// L3.4 (CTE lineage, pilot: T-SQL only) — resolve a CTE-scoped column read against the
+        /// L3.4 (CTE lineage: T-SQL, Postgres, PL/SQL) — resolve a CTE-scoped column read against the
         /// real table/column it re-projects, instead of leaving it unresolved. Off by default,
         /// persisted like --sql-columns; implies --sql-columns (a CTE read resolves against real
         /// column defs, which need it on).

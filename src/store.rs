@@ -484,7 +484,7 @@ pub struct Store {
     /// behavior exactly.
     sql_columns: bool,
     /// L3.4 (CTE lineage) — meta key `sql_cte`, set by `index --with-sql-cte`. Off by default:
-    /// pilot-scoped (T-SQL only so far), shipped dark until proven out. False -> the walk still
+    /// covers T-SQL, Postgres, and PL/SQL; shipped dark until proven out. False -> the walk still
     /// exports `ParsedFile::cte_columns` (unconditional, see its doc comment) but `parse_one_file`
     /// never applies it, so a CTE-scoped read resolves exactly as it did before this feature
     /// existed (unresolved, its receiver_class is a name no `symbols` row ever has).

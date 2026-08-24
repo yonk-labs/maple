@@ -66,6 +66,25 @@ fn scope_receiver(scope: &HashMap<String, String>, qualifier: Option<&str>) -> O
     }
 }
 
+/// L3.4 (CTE lineage) — descend through single-named-child wrapper nodes (postgres's
+/// `a_expr` -> `a_expr` -> `c_expr` precedence-climbing chain; a no-op single hop for plsql's
+/// `expression` -> `referenced_element`) until landing on a node of `leaf_kind`, or `None` if
+/// anything along the way has more than one named child (a binary operator, function call, `*`,
+/// etc. — not a bare passthrough). A CTE's select-list value is always wrapped this way even for a
+/// plain column, so this is the only way to tell "just a column" apart from "an expression that
+/// happens to contain one".
+fn bare_leaf<'t>(mut n: Node<'t>, leaf_kind: &str) -> Option<Node<'t>> {
+    loop {
+        if n.kind() == leaf_kind {
+            return Some(n);
+        }
+        if n.named_child_count() != 1 {
+            return None;
+        }
+        n = n.named_child(0).unwrap();
+    }
+}
+
 /// Emit one column-reference `CallSite`. Deliberately NOT routed through `push_call` — its
 /// builtin-name filter exists for function names, not column names, and would be a category error
 /// here (a column genuinely named `count` or `left` is common and not a builtin call).
@@ -835,6 +854,118 @@ pub fn parse_plsql(src: &str) -> anyhow::Result<ParsedFile> {
     Ok(out)
 }
 
+/// L3.4 (CTE lineage) — plsql counterpart to `tsql_cte_projections`/`pg_cte_projections` (see the
+/// former's doc comment for the overall projection design). Unlike either, a plsql `with_clause`
+/// has no per-CTE wrapper node at all — EVERY CTE's pieces (`query_name`, optional
+/// `( referenced_element_repeat )` column list, `kw_as`, `(`, body pieces, `)`) sit as FLAT SIBLINGS
+/// directly under `with_clause`, chained by a `,` between CTEs (confirmed via grammar dump: two
+/// CTEs produce one `with_clause` with both bodies' pieces interleaved in source order, no grouping
+/// node to recurse into). So this walks the flat child list with a manual index instead of
+/// recursing per-CTE, using `kw_as`/`(`/`)` as the only structural landmarks.
+///
+/// Also does double duty pushing each CTE body's OWN column reads to `out` (a `read` access,
+/// exactly like `"sql_statement_select"`'s own handling) — unlike tsql/postgres, where the body is
+/// a nested `statement`/`SelectStmt` the generic recursion visits and extracts on its own, plsql's
+/// flattened shape means nothing else ever visits these pieces; without this the body's own reads
+/// (e.g. a CTE's WHERE clause) were never extracted at all, CTE or no CTE-lineage feature.
+fn plsql_walk_with_clause(with_clause: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str) {
+    let mut projections: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+    let children: Vec<(Option<&'static str>, Node)> = {
+        let mut c = with_clause.walk();
+        let mut v = Vec::new();
+        if c.goto_first_child() {
+            loop {
+                v.push((c.field_name(), c.node()));
+                if !c.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        v
+    };
+    let mut i = 0;
+    while i < children.len() {
+        if children[i].0 != Some("query_name") {
+            i += 1;
+            continue;
+        }
+        let cte_name = norm(text(children[i].1, src));
+        i += 1;
+        let mut explicit_cols = Vec::new();
+        if i < children.len() && children[i].1.kind() == "(" {
+            i += 1;
+            if i < children.len() && children[i].1.kind() == "referenced_element_repeat" {
+                let mut cw = children[i].1.walk();
+                explicit_cols = children[i]
+                    .1
+                    .named_children(&mut cw)
+                    .filter(|n| n.kind() == "referenced_element")
+                    .filter_map(|n| n.child_by_field_name("ref_name"))
+                    .map(|n| norm(text(n, src)))
+                    .collect();
+                i += 1;
+            }
+            if i < children.len() && children[i].1.kind() == ")" {
+                i += 1;
+            }
+        }
+        if i < children.len() && children[i].1.kind() == "kw_as" {
+            i += 1;
+        }
+        if !(i < children.len() && children[i].1.kind() == "(") {
+            continue; // unexpected shape (e.g. an error node) — skip this CTE defensively
+        }
+        i += 1;
+        let (mut select_list, mut table_list, mut where_clause) = (None, None, None);
+        while i < children.len() && children[i].1.kind() != ")" {
+            match children[i].1.kind() {
+                "select_list" => select_list = Some(children[i].1),
+                "table_list" => table_list = Some(children[i].1),
+                "where_clause" => where_clause = Some(children[i].1),
+                _ => {}
+            }
+            i += 1;
+        }
+        if i < children.len() {
+            i += 1; // consume the body's closing ")"
+        }
+        let (Some(select_list), Some(table_list)) = (select_list, table_list) else { continue };
+        let body_scope = plsql_table_scope(table_list, src);
+
+        // Body's own reads — the extraction the generic recursion never reaches for a CTE body
+        // (see doc comment above).
+        push_plsql_referenced_element_refs(out, select_list, src, &body_scope, "read", enclosing);
+        if let Some(w) = where_clause {
+            push_plsql_referenced_element_refs(out, w, src, &body_scope, "read", enclosing);
+        }
+
+        let mut proj = HashMap::new();
+        let mut cw2 = select_list.walk();
+        let elements: Vec<Node> =
+            select_list.named_children(&mut cw2).filter(|n| n.kind() == "select_list_element").collect();
+        for (idx, elem) in elements.into_iter().enumerate() {
+            let alias = find_child(elem, "identifier").map(|n| norm(text(n, src)));
+            let bare = find_child(elem, "expression").and_then(|v| bare_leaf(v, "referenced_element"));
+            let derived_name = bare.and_then(|re| plsql_referenced_element_parts(re, src).1).map(norm);
+            let out_name = explicit_cols.get(idx).cloned().or(alias).or(derived_name);
+            let (Some(out_name), Some(re)) = (out_name, bare) else { continue };
+            let (qualifier, column) = plsql_referenced_element_parts(re, src);
+            let Some(column) = column else { continue };
+            let Some(real_table) = scope_receiver(&body_scope, qualifier) else { continue };
+            if real_table.contains('\u{1f}') {
+                continue; // ambiguous underlying table, never guess
+            }
+            proj.insert(out_name, (real_table, norm(column)));
+        }
+        if !proj.is_empty() {
+            projections.entry(cte_name).or_insert(proj);
+        }
+    }
+    for (k, v) in projections {
+        out.cte_columns.entry(k).or_insert(v);
+    }
+}
+
 fn walk_plsql(
     node: Node,
     src: &[u8],
@@ -958,6 +1089,14 @@ fn walk_plsql(
                     }
                 }
             }
+        }
+        // L3.4 (CTE lineage): each CTE body's own reads, plus the projection map used to resolve
+        // the OUTER query's references to it (built and applied in `plsql_walk_with_clause`). The
+        // outer query's own select_list/table_list/where_clause are UNAFFECTED — they're direct
+        // children of `sql_statement_select` itself (siblings of `with_clause`, not inside it), so
+        // that arm below reaches them exactly as it did before this feature existed.
+        "with_clause" if !in_error => {
+            plsql_walk_with_clause(node, src, out, enclosing);
         }
         // L3.3: SELECT list + JOIN-ON + WHERE column references, all reads. Matched on both
         // `sql_statement_select` (top-level) and `scalar_subquery` (a nested query — a DIFFERENT
@@ -1215,8 +1354,64 @@ fn push_pg_columnref_refs(
     }
 }
 
+/// L3.4 (CTE lineage) — postgres counterpart to `tsql_cte_projections` (see its doc comment for the
+/// overall design). Different grammar shape: `with_clause -> cte_list -> common_table_expr`, each
+/// with a `name` node (its own span IS the CTE name) and an optional `opt_name_list` explicit
+/// column list. The body sits three wrapper layers below `common_table_expr`
+/// (`PreparableStmt -> SelectStmt -> select_no_parens -> simple_select`) — the same chain the
+/// `"simple_select"` walk arm reaches generically for the body's OWN extraction; this reaches it
+/// explicitly to also read its scope for the projection.
+fn pg_cte_projections(with_clause: Node, src: &[u8]) -> HashMap<String, HashMap<String, (String, String)>> {
+    let mut out = HashMap::new();
+    let Some(cte_list) = find_child(with_clause, "cte_list") else { return out };
+    for cte in find_descendants_scoped(cte_list, "common_table_expr", &[]) {
+        let Some(name_node) = find_child(cte, "name") else { continue };
+        let cte_name = norm(text(name_node, src));
+        let explicit_cols: Vec<String> = find_child(cte, "opt_name_list")
+            .map(|onl| find_descendants_scoped(onl, "name", &[]).iter().map(|n| norm(text(*n, src))).collect())
+            .unwrap_or_default();
+        let Some(prep) = find_child(cte, "PreparableStmt") else { continue };
+        let Some(select_stmt) = find_child(prep, "SelectStmt") else { continue };
+        let Some(select_no_parens) = find_child(select_stmt, "select_no_parens") else { continue };
+        let Some(body_select) = find_child(select_no_parens, "simple_select") else { continue };
+        let body_scope = find_descendants_scoped(body_select, "from_clause", PG_DML_STOP)
+            .into_iter()
+            .next()
+            .map(|f| pg_table_scope(f, src))
+            .unwrap_or_default();
+        let Some(opt_targets) = find_child(body_select, "opt_target_list") else { continue };
+        let mut proj = HashMap::new();
+        let targets = find_descendants_scoped(opt_targets, "target_el", &[]);
+        for (idx, target_el) in targets.into_iter().enumerate() {
+            let alias = find_child(target_el, "ColLabel").map(|n| norm(text(n, src)));
+            let bare = find_child(target_el, "a_expr").and_then(|v| bare_leaf(v, "columnref"));
+            let derived_name = bare.and_then(|cr| pg_columnref_parts(cr, src).1).map(norm);
+            let out_name = explicit_cols.get(idx).cloned().or(alias).or(derived_name);
+            let (Some(out_name), Some(cr)) = (out_name, bare) else { continue };
+            let (qualifier, column) = pg_columnref_parts(cr, src);
+            let Some(column) = column else { continue };
+            let Some(real_table) = scope_receiver(&body_scope, qualifier) else { continue };
+            if real_table.contains('\u{1f}') {
+                continue; // ambiguous underlying table, never guess
+            }
+            proj.insert(out_name, (real_table, norm(column)));
+        }
+        if !proj.is_empty() {
+            out.entry(cte_name).or_insert(proj);
+        }
+    }
+    out
+}
+
 fn walk_pg(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &mut PgParsers, in_error: bool) {
     let in_error = entering_error(node, in_error);
+    if node.kind() == "select_no_parens" {
+        if let Some(wc) = find_child(node, "with_clause") {
+            for (k, v) in pg_cte_projections(wc, src) {
+                out.cte_columns.entry(k).or_insert(v);
+            }
+        }
+    }
     let mut def_name: Option<String> = None;
     match node.kind() {
         // covers CREATE FUNCTION and CREATE PROCEDURE (one grammar rule for both)
@@ -1879,6 +2074,61 @@ GO
         assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
     }
 
+    // ---- L3.4: CTE lineage (plsql) ----
+
+    #[test]
+    fn plsql_cte_projections_track_bare_passthrough_columns() {
+        let p = parse_plsql(
+            "BEGIN\n  WITH recent(order_id, cid) AS (\n    SELECT order_id, customer_id FROM orders WHERE total > 100\n  )\n  SELECT r.order_id, r.cid INTO x, y FROM recent r WHERE r.order_id > 0;\nEND;\n/\n",
+        )
+        .unwrap();
+        let proj = p.cte_columns.get("recent").expect("recent CTE tracked");
+        assert_eq!(proj.get("order_id"), Some(&("orders".to_string(), "order_id".to_string())));
+        assert_eq!(proj.get("cid"), Some(&("orders".to_string(), "customer_id".to_string())));
+    }
+
+    #[test]
+    fn plsql_cte_projections_use_derived_name_without_explicit_column_list() {
+        let p = parse_plsql(
+            "BEGIN\n  WITH old AS (SELECT order_id FROM orders)\n  SELECT order_id INTO x FROM old;\nEND;\n/\n",
+        )
+        .unwrap();
+        let proj = p.cte_columns.get("old").expect("old CTE tracked");
+        assert_eq!(proj.get("order_id"), Some(&("orders".to_string(), "order_id".to_string())));
+    }
+
+    #[test]
+    fn plsql_cte_projections_skip_computed_columns_never_guess() {
+        let p = parse_plsql(
+            "BEGIN\n  WITH counts AS (\n    SELECT ROUND(total, 2) AS rounded, order_id FROM order_items\n  )\n  SELECT order_id INTO x FROM counts;\nEND;\n/\n",
+        )
+        .unwrap();
+        let proj = p.cte_columns.get("counts").expect("counts CTE tracked");
+        assert!(!proj.contains_key("rounded"), "function-call output must never be guessed");
+        assert_eq!(proj.get("order_id"), Some(&("order_items".to_string(), "order_id".to_string())));
+    }
+
+    #[test]
+    fn plsql_cte_projections_skip_ambiguous_join_body() {
+        let p = parse_plsql(
+            "BEGIN\n  WITH j AS (\n    SELECT id FROM orders o JOIN order_items i ON i.order_id = o.id\n  )\n  SELECT id INTO x FROM j;\nEND;\n/\n",
+        )
+        .unwrap();
+        assert!(p.cte_columns.get("j").is_none_or(|m| !m.contains_key("id")));
+    }
+
+    #[test]
+    fn plsql_cte_body_own_reads_are_extracted() {
+        // Unlike tsql/postgres, a plsql CTE body has no nested `statement`/`SelectStmt` wrapper for
+        // the generic recursion to find on its own (see `plsql_walk_with_clause`'s doc comment) —
+        // without its explicit push, the body's own WHERE-clause read was never extracted at all.
+        let p = parse_plsql(
+            "BEGIN\n  WITH recent AS (\n    SELECT order_id FROM orders WHERE total > 100\n  )\n  SELECT order_id INTO x FROM recent;\nEND;\n/\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "total", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
     #[test]
     fn plsql_package_spec_body_and_standalone() {
         let src = "\
@@ -2164,6 +2414,46 @@ $$ LANGUAGE 'plpgsql';
         assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
         assert_eq!(find_col(&p, "order_id", "read").receiver_class.as_deref(), Some("order_items"));
         assert_eq!(find_col(&p, "total", "read").receiver_class.as_deref(), Some("order_items"));
+    }
+
+    // ---- L3.4: CTE lineage (postgres) ----
+
+    #[test]
+    fn pg_cte_projections_track_bare_passthrough_columns() {
+        let p = parse_postgres(
+            "WITH recent(order_id, cid) AS (\n  SELECT orderid, customerid AS cid FROM orders WHERE total > 100\n)\nSELECT r.order_id, r.cid FROM recent r WHERE r.order_id > 0;\n",
+        )
+        .unwrap();
+        let proj = p.cte_columns.get("recent").expect("recent CTE tracked");
+        assert_eq!(proj.get("order_id"), Some(&("orders".to_string(), "orderid".to_string())));
+        assert_eq!(proj.get("cid"), Some(&("orders".to_string(), "customerid".to_string())));
+    }
+
+    #[test]
+    fn pg_cte_projections_use_derived_name_without_explicit_column_list() {
+        let p = parse_postgres("WITH old AS (SELECT orderid FROM orders)\nSELECT * FROM old;\n").unwrap();
+        let proj = p.cte_columns.get("old").expect("old CTE tracked");
+        assert_eq!(proj.get("orderid"), Some(&("orders".to_string(), "orderid".to_string())));
+    }
+
+    #[test]
+    fn pg_cte_projections_skip_computed_columns_never_guess() {
+        let p = parse_postgres(
+            "WITH counts AS (\n  SELECT count(*) AS total, order_id FROM order_items GROUP BY order_id\n)\nSELECT order_id FROM counts;\n",
+        )
+        .unwrap();
+        let proj = p.cte_columns.get("counts").expect("counts CTE tracked");
+        assert!(!proj.contains_key("total"), "aggregate output must never be guessed");
+        assert_eq!(proj.get("order_id"), Some(&("order_items".to_string(), "order_id".to_string())));
+    }
+
+    #[test]
+    fn pg_cte_projections_skip_ambiguous_join_body() {
+        let p = parse_postgres(
+            "WITH j AS (SELECT id FROM orders o JOIN order_items i ON i.order_id = o.id)\nSELECT id FROM j;\n",
+        )
+        .unwrap();
+        assert!(p.cte_columns.get("j").is_none_or(|m| !m.contains_key("id")));
     }
 
     #[test]
