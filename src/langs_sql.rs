@@ -286,6 +286,36 @@ fn walk_tsql(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, in_e
                 }
             }
         }
+        // L3.2: `CREATE TABLE [schema.]name (col type ..., col type ..., ...)` -> a `table` def
+        // plus one `column` def per column, parent_class = table name (same pattern Oracle package
+        // members already use). `column_definition` carries a `name:` field directly — as clean as
+        // the procedure-param walk this mirrors.
+        "create_table" => {
+            if let Some(or) = find_child(node, "object_reference") {
+                let (schema, name) = obj_ref_parts(or, src);
+                if let Some(nm) = name {
+                    let d = mk_def(nm, "table", schema, node, src);
+                    let table_name = d.name.clone();
+                    def_name = Some(table_name.clone());
+                    out.defs.push(d);
+                    if let Some(cols) = find_child(node, "column_definitions") {
+                        walk_children(cols, |cd| {
+                            if cd.kind() == "column_definition" {
+                                if let Some(cn) = cd.child_by_field_name("name") {
+                                    out.defs.push(mk_def(
+                                        text(cn, src),
+                                        "column",
+                                        Some(&table_name),
+                                        cd,
+                                        src,
+                                    ));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
         // `foo(...)` in any expression, and `EXEC [dbo.]proc` — schema-qualified -> method kind.
         "invocation" | "execute_statement" if !in_error => {
             if let Some(or) = find_child(node, "object_reference") {
@@ -456,6 +486,32 @@ fn walk_plsql(
                 out.defs.push(d);
             }
         }
+        // L3.2: `CREATE TABLE name (col type ..., ...)` -> a `table` def plus one `column` def per
+        // column. Both `table_name:` and each `table_column_definition`'s `column_name:` are direct
+        // field-named nodes — as clean as the procedure-param walk this mirrors.
+        "create_table" => {
+            if let Some(nm) = node.child_by_field_name("table_name") {
+                let d = mk_def(text(nm, src), "table", None, node, src);
+                let table_name = d.name.clone();
+                def_name = Some(table_name.clone());
+                out.defs.push(d);
+                walk_children(node, |te| {
+                    if te.kind() == "table_element" {
+                        if let Some(cd) = find_child(te, "table_column_definition") {
+                            if let Some(cn) = cd.child_by_field_name("column_name") {
+                                out.defs.push(mk_def(
+                                    text(cn, src),
+                                    "column",
+                                    Some(&table_name),
+                                    te,
+                                    src,
+                                ));
+                            }
+                        }
+                    }
+                });
+            }
+        }
         // `name(...)` anywhere — qualified (`pkg.proc`, `schema.pkg.proc`) -> method kind on the
         // member name, with the qualifier as a receiver-class hint: it's syntactically free (like
         // a Go receiver) and lets `htp.print()` vs `htf.print()` resolve to the right package's
@@ -573,6 +629,34 @@ fn walk_pg(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &m
                 pg_plpgsql_body(body, src, out, enclosing, ps);
             }
         }
+        // L3.2: `CREATE TABLE name (col type ..., ...)` -> a `table` def plus one `column` def per
+        // column. `TableElementList` is left-recursive (not a flat sibling list like tsql's) so
+        // `find_descendants` walks the whole subtree for every `columnDef`, not just direct
+        // children — still exact (columnDef never nests another columnDef), just more code than
+        // tsql/plsql's field-named lists.
+        "CreateStmt" if find_child(node, "kw_table").is_some() => {
+            if let Some(qn) = find_child(node, "qualified_name") {
+                if let Some(nm) = find_child(qn, "ColId").and_then(|c| find_child(c, "identifier")) {
+                    let d = mk_def(text(nm, src), "table", None, node, src);
+                    let table_name = d.name.clone();
+                    def_name = Some(table_name.clone());
+                    out.defs.push(d);
+                    for col in find_descendants(node, "columnDef") {
+                        if let Some(cn) =
+                            find_child(col, "ColId").and_then(|c| find_child(c, "identifier"))
+                        {
+                            out.defs.push(mk_def(
+                                text(cn, src),
+                                "column",
+                                Some(&table_name),
+                                col,
+                                src,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         // plain SQL calls in the outer file (SELECT setup(); triggers' EXECUTE FUNCTION; defaults)
         "func_application" if !in_error => {
             if let Some(fname) = find_child(node, "func_name") {
@@ -606,6 +690,29 @@ fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
         }
     }
     None
+}
+
+/// EVERY descendant of `kind` (not just the first) — L3.2 needs this for `columnDef`, since
+/// postgres's `TableElementList` is a left-recursive list (`TableElementList -> TableElementList
+/// TableElement | TableElement`), not a flat sibling list the way tsql's `column_definitions` is.
+/// Does not recurse into a matched node's own subtree (`columnDef` never nests another `columnDef`
+/// in this grammar, so this is exact, not a heuristic bound).
+fn find_descendants<'t>(node: Node<'t>, kind: &str) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == kind {
+            out.push(n);
+            continue;
+        }
+        let mut c = n.walk();
+        // push in reverse so popping the stack visits children left-to-right, keeping `out` in
+        // the same order columns appear in source (matters for readable, stable test output).
+        for child in n.named_children(&mut c).collect::<Vec<_>>().into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    out
 }
 
 /// A CreateFunctionStmt's body is a string literal — find `LANGUAGE x` and the dollar-quoted body,
@@ -833,13 +940,36 @@ GO
     }
 
     #[test]
-    fn tsql_ddl_only_is_symbolless_ok() {
-        let p = parse_tsql("CREATE TABLE t (id INT PRIMARY KEY);\n").unwrap();
-        assert!(p.defs.is_empty() && p.calls.is_empty());
-        assert!(p.symbolless_ok);
+    fn tsql_create_table_extracts_table_and_column_defs() {
+        // L3.2: CREATE TABLE used to produce zero defs (Wave L2 scope). Now it's a `table` def
+        // plus one `column` def per column, parent_class = table name.
+        let p = parse_tsql("CREATE TABLE t (id INT PRIMARY KEY, status VARCHAR(20));\n").unwrap();
+        assert!(p.calls.is_empty());
+        let table = p.defs.iter().find(|d| d.name == "t" && d.kind == "table").expect("table def");
+        assert!(table.parent_class.is_none());
+        let id = p.defs.iter().find(|d| d.name == "id" && d.kind == "column").expect("id column");
+        assert_eq!(id.parent_class.as_deref(), Some("t"));
+        let status = p.defs.iter().find(|d| d.name == "status" && d.kind == "column").expect("status column");
+        assert_eq!(status.parent_class.as_deref(), Some("t"));
+        assert_eq!(p.defs.len(), 3, "table + 2 columns, nothing else");
     }
 
     // ---- PL/SQL ----
+
+    #[test]
+    fn plsql_create_table_extracts_table_and_column_defs() {
+        // L3.2: CREATE TABLE used to produce zero defs (Wave L2 scope).
+        let src = "CREATE TABLE orders (id NUMBER PRIMARY KEY, status VARCHAR2(20) NOT NULL);\n";
+        let p = parse_plsql(src).unwrap();
+        assert!(p.calls.is_empty());
+        let table = p.defs.iter().find(|d| d.name == "orders" && d.kind == "table").expect("table def");
+        assert!(table.parent_class.is_none());
+        let id = p.defs.iter().find(|d| d.name == "id" && d.kind == "column").expect("id column");
+        assert_eq!(id.parent_class.as_deref(), Some("orders"));
+        let status = p.defs.iter().find(|d| d.name == "status" && d.kind == "column").expect("status column");
+        assert_eq!(status.parent_class.as_deref(), Some("orders"));
+        assert_eq!(p.defs.len(), 3, "table + 2 columns, nothing else");
+    }
 
     #[test]
     fn plsql_package_spec_body_and_standalone() {
@@ -1023,10 +1153,17 @@ $$ LANGUAGE 'plpgsql';
     }
 
     #[test]
-    fn pg_ddl_only_is_symbolless_ok() {
-        let p = parse_postgres("CREATE TABLE t (id int primary key);\n").unwrap();
-        assert!(p.defs.is_empty() && p.calls.is_empty());
-        assert!(p.symbolless_ok);
+    fn pg_create_table_extracts_table_and_column_defs() {
+        // L3.2: CREATE TABLE used to produce zero defs (Wave L2 scope).
+        let p = parse_postgres("CREATE TABLE t (id int primary key, status varchar(20));\n").unwrap();
+        assert!(p.calls.is_empty());
+        let table = p.defs.iter().find(|d| d.name == "t" && d.kind == "table").expect("table def");
+        assert!(table.parent_class.is_none());
+        let id = p.defs.iter().find(|d| d.name == "id" && d.kind == "column").expect("id column");
+        assert_eq!(id.parent_class.as_deref(), Some("t"));
+        let status = p.defs.iter().find(|d| d.name == "status" && d.kind == "column").expect("status column");
+        assert_eq!(status.parent_class.as_deref(), Some("t"));
+        assert_eq!(p.defs.len(), 3, "table + 2 columns, nothing else");
     }
 
     #[test]
@@ -1039,3 +1176,4 @@ $$ LANGUAGE 'plpgsql';
         assert!(blank_dollar_delims("'not dollar'").is_none());
     }
 }
+

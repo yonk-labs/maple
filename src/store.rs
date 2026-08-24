@@ -3611,8 +3611,9 @@ mod tests {
     }
 
     /// L2.5 PostgreSQL — `--sql-dialect=postgres`: a plpgsql body's PERFORM resolves exact
-    /// cross-file; schema-qualified call in a body lands kind `method`; DDL-only file is neither
-    /// suspect nor a def source.
+    /// cross-file; schema-qualified call in a body lands kind `method`; DDL-only file is not
+    /// suspect (L3.2: it DOES now contribute defs — a `table` + its `column`s — this test's
+    /// job is confirming that's the ONLY thing schema.sql contributes, not that it's zero).
     #[test]
     fn l2_postgres_fixture_pair() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3641,7 +3642,8 @@ mod tests {
         assert!(s.parse_failures().unwrap().is_empty(), "DDL-only schema.sql is not suspect");
         let ddl_syms: i64 =
             s.conn.query_row("SELECT COUNT(*) FROM symbols WHERE file='schema.sql'", [], |r| r.get(0)).unwrap();
-        assert_eq!(ddl_syms, 0);
+        assert_eq!(ddl_syms, 2, "L3.2: table `orders` + column `id`, nothing else");
+        assert_eq!(parent_of(&s, "id").as_deref(), Some("orders"), "column's parent is its table");
     }
 
     /// L2.5 Oracle — `.pks`/`.pkb` need NO dialect flag: the spec's decl emits no def, the body's
