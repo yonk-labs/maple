@@ -32,6 +32,51 @@ shape for it:
 No new tables. Two new `symbols.kind` values (`table`/`view` — `column` is a third symbol kind, not
 a fourth table). Two new `edges.call_kind` values (`read`/`write`).
 
+## Ship dark — `--sql-columns`, off by default (settled, implemented in L3.1/L3.2)
+
+New, unvalidated extraction behavior does not go on by default the moment the walk code lands.
+`maple index --sql-columns` (persisted in the store's meta table, same pattern `--sql-dialect`
+already uses) gates table/column def extraction; unset, a repo behaves exactly as it did before
+this wave — `CREATE TABLE` parses but contributes zero defs, byte-identical to pre-L3 output. The
+gate lives one layer above the walk (`store.rs::parse_one_file`, filtering `kind="table"/"column"`
+defs before the suspect-file check runs), not inside the dialect walk functions themselves — the
+walk always CAN produce these defs; the store decides whether to keep them. Phase B and Phase C's
+new `edges`/resolution output should be gated by the same flag when they land, not a separate one.
+
+## Phase B resolution architecture (settled — see 2026-08-24 Fable review, summarized here)
+
+Neither of the two options originally sketched in Phase B below, cleanly — a synthesis:
+
+- **Dispatch, don't parallel-pass.** maple's incremental refresh (`store.rs`, "pass B") relabels
+  edges in *unchanged* files purely by re-running resolution from an edge's stored fields
+  (`callee_name`, `call_kind`, `receiver_class`, `call_site_file`, `lang`) — no re-parse. A column
+  resolver that isn't reconstructible from exactly that tuple leaves stale labels on DML edges after
+  a schema change in a different file. So: a dedicated `resolve_column_ref` function, but dispatched
+  from the TOP of the existing `resolve_call` (on `call_kind == "read" | "write"`), not a fully
+  separate pass that would have to duplicate pass-B's relabel machinery.
+- **Don't share `resolve_call`'s body.** Its candidate query has no `kind` filter and its universal
+  fallback (lone same-named candidate → exact) would produce false-exact matches for columns (a bare
+  `status` reference matching an unrelated same-named procedure). Dispatch must intercept BEFORE any
+  existing branch runs.
+- **Scope set rides in `receiver_class`, delimited.** Zero schema change: qualified (`o.status`) →
+  `receiver_class = Some("orders")` (single table, alias resolved locally at walk time — same
+  mechanism the PL/SQL package-qualifier hint already uses). Unqualified with N candidate tables in
+  a FROM/JOIN scope → `receiver_class = Some("orders\x1forder_items")` (join every in-scope table
+  name, normalized to match `parent_class`'s casing/quoting). Resolver: `SELECT id FROM symbols
+  WHERE name=?col AND lang=?lang AND kind='column' AND parent_class IN (<scope set>)` — 1 row exact,
+  2+ ambiguous, 0 unresolved. No fallback tiers, ever.
+- **Regression safety is structural, not tested-in.** No existing language emits `call_kind` other
+  than `"func"`/`"method"` — a first-line dispatch on `"read"`/`"write"` leaves every current
+  resolution path untouched by construction, not just unbroken by the fixture gate.
+- **Cross-file ordering is a non-issue.** Cold index inserts every file's symbols before resolving
+  any edge — order across files never matters here, confirmed against the actual cold-index loop.
+  The incremental refresh trigger (which edges get relabeled after a change) keys off `callee_name`
+  among the changed defs, which already covers a column rename/add/drop correctly.
+- **One landmine to comment in code when built:** the refresh trigger's `receiver_class=?` half of
+  its match won't equality-match a delimited multi-name value — intentional (column-edge relabels
+  are always driven by the column NAME changing, not the scope set), but non-obvious enough that a
+  future pass could "fix" it by accident without the comment.
+
 ## Scope (three phases, deliberately separable — see Sequencing)
 
 - **Phase A — column defs from DDL.** `CREATE TABLE` explicit column list → `column` symbols under a
