@@ -137,6 +137,7 @@ fn parse_one_file(
     sql: Option<crate::parser::SqlDialect>,
     sql_columns: bool,
     sql_cte: bool,
+    orm_python: bool,
 ) -> FileParse {
     let lang = crate::parser::lang_for_path(path, sql).expect("walker only yields registered extensions");
     let outcome = match std::fs::read(path) {
@@ -160,6 +161,11 @@ fn parse_one_file(
                     }
                     if sql_cte {
                         apply_cte_columns(&mut parsed);
+                    }
+                    // L3.5 — ORM field->column edges are opt-in (see `Store::orm_python` doc). Same
+                    // "walk stays unconditional, storage-policy gate" split as `sql_columns` above.
+                    if !orm_python {
+                        parsed.calls.retain(|c| c.kind != "orm-map");
                     }
                     // T15: tree-sitter is error-tolerant (rarely returns Err above) — a non-empty
                     // file that parses to zero defs+calls+imports is the actually-triggerable
@@ -489,6 +495,12 @@ pub struct Store {
     /// never applies it, so a CTE-scoped read resolves exactly as it did before this feature
     /// existed (unresolved, its receiver_class is a name no `symbols` row ever has).
     sql_cte: bool,
+    /// L3.5 (Phase C) — meta key `orm_python`, set by `index --orm-python`. Off by default: new,
+    /// unvalidated, single-ORM-first (SQLAlchemy) behavior, shipped dark until proven out. False ->
+    /// the Python walk still extracts `call_kind="orm-map"` sites unconditionally (see
+    /// `orm_model_fields`'s doc comment) but `parse_one_file` strips them before storage, so an ORM
+    /// model field contributes no edge at all — restoring pre-Phase-C behavior exactly.
+    orm_python: bool,
 }
 
 impl Store {
@@ -549,7 +561,12 @@ impl Store {
             .optional()?
             .map(|v| v == "1")
             .unwrap_or(false);
-        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect, sql_columns, sql_cte })
+        let orm_python = conn
+            .query_row("SELECT value FROM meta WHERE key='orm_python'", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect, sql_columns, sql_cte, orm_python })
     }
 
     /// L2.1 — persist the repo's `.sql` dialect so refresh/queries (and seeded copies) inherit it.
@@ -588,6 +605,19 @@ impl Store {
         Ok(())
     }
 
+    /// L3.5 (Phase C) — persist whether Python ORM model fields resolve cross-language against real
+    /// schema columns, so refresh inherits it the same way `set_sql_cte` does. Off by default (see
+    /// the `orm_python` field doc).
+    pub fn set_orm_python(&mut self, on: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('orm_python',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if on { "1" } else { "0" }],
+        )?;
+        self.orm_python = on;
+        Ok(())
+    }
+
     /// Cold full index: parse all registered-language files, persist symbols/imports, then resolve edges.
     ///
     /// F1 — CRITICAL: clearing the old graph and writing the new one happen inside ONE transaction,
@@ -603,6 +633,7 @@ impl Store {
         let sql = self.sql_dialect;
         let sql_columns = self.sql_columns;
         let sql_cte = self.sql_cte;
+        let orm_python = self.orm_python;
         let files = source_files(root, sql);
         let mut st = IndexStats::default();
 
@@ -613,7 +644,7 @@ impl Store {
             .par_iter()
             .map(|path| {
                 let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-                parse_one_file(path, rel, sql, sql_columns, sql_cte)
+                parse_one_file(path, rel, sql, sql_columns, sql_cte, orm_python)
             })
             .collect();
 
@@ -1776,6 +1807,30 @@ fn resolve_column_ref(
     })
 }
 
+/// L3.5 (Phase C) — resolve a Python ORM model field's mapped column against real schema, across
+/// ANY sql-* dialect (see the "orm-map" dispatch comment in `resolve_call` for why this is the one
+/// deliberate lang exception). `receiver_class` is always a SINGLE table name here (from
+/// `__tablename__` — never a delimited candidate set the way `resolve_column_ref`'s can be), so 2+
+/// matches can only mean the same table name is genuinely defined more than once in the indexed
+/// schema (e.g. a duplicate-schema corpus) — ambiguous, never guessed, same discipline as every
+/// other resolver in this file.
+fn resolve_orm_map(conn: &Connection, name: &str, receiver_class: Option<&str>) -> Result<(Option<i64>, &'static str)> {
+    let Some(table) = receiver_class else {
+        return Ok((None, "unresolved"));
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM symbols WHERE name=?1 AND kind='column' AND parent_class=?2 \
+         AND lang IN ('sql-postgres','sql-tsql','sql-plsql')",
+    )?;
+    let ids: Vec<i64> =
+        stmt.query_map(params![name, table], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    Ok(match ids.len() {
+        0 => (None, "unresolved"),
+        1 => (Some(ids[0]), "exact"),
+        _ => (None, "ambiguous"),
+    })
+}
+
 /// Resolve a (post-alias) call against the symbols table: (callee_symbol, label).
 /// The label domain is exactly {exact, ambiguous, unresolved} — never a score (N2).
 ///
@@ -1811,6 +1866,15 @@ fn resolve_call(
     // other resolution path byte-identical by construction, not just unbroken by the test suite.
     if call_kind == "read" || call_kind == "write" {
         return resolve_column_ref(conn, name, receiver_class, lang);
+    }
+    // L3.5 (Phase C) — the one DELIBERATE cross-language exception to this function's lang-scoping
+    // (L2.1's whole point was preventing exactly this kind of cross-language false match elsewhere):
+    // an ORM model field's caller is Python, but its target is a `column` symbol whose `lang` is
+    // whichever SQL dialect the repo is configured for. `resolve_orm_map` ignores `lang` entirely
+    // and is the ONLY resolver in this file that does — scoped to exactly this call_kind, so no
+    // other resolution path is ever affected by it.
+    if call_kind == "orm-map" {
+        return resolve_orm_map(conn, name, receiver_class);
     }
     let mut stmt =
         conn.prepare_cached("SELECT id, parent_class, file FROM symbols WHERE name=?1 AND lang=?2")?;
@@ -3934,6 +3998,68 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(v, 1, "sql_cte=on persisted across Store::open");
+    }
+
+    /// L3.5 (Phase C) — a SQLAlchemy model field resolves cross-language against the real schema
+    /// column it maps to. Off by default: the orm-map call is stripped before storage entirely (no
+    /// edge row at all — same "restores pre-feature behavior exactly" contract as `sql_columns`),
+    /// not merely left unresolved. On: `exact`, `callee_symbol` points at the SQL column def, and
+    /// the `name=` override on `email` picks the real column over the Python attribute name.
+    #[test]
+    fn l3_5_orm_python_is_opt_in_and_resolves_cross_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("schema.sql"),
+            "CREATE TABLE users (id INT, username VARCHAR(50), email_address VARCHAR(100));\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("models.py"),
+            "from sqlalchemy import Column, Integer, String\nfrom sqlalchemy.orm import declarative_base\n\nBase = declarative_base()\n\nclass User(Base):\n    __tablename__ = 'users'\n    id = Column(Integer, primary_key=True)\n    email = Column(\"email_address\", String(100))\n",
+        )
+        .unwrap();
+
+        let mut off = Store::open(root).unwrap();
+        off.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        off.set_sql_columns(true).unwrap();
+        off.index_repo(root).unwrap();
+        let off_edges: i64 = off
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges WHERE call_kind='orm-map'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(off_edges, 0, "orm_python off by default -> no orm-map edge at all");
+
+        let mut on = Store::open(root).unwrap();
+        on.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        on.set_sql_columns(true).unwrap();
+        on.set_orm_python(true).unwrap();
+        on.index_repo(root).unwrap();
+        assert_eq!(
+            resolved(&on, "id", "User"),
+            ("exact".into(), Some("schema.sql".into())),
+            "User.id -> users.id, cross-language"
+        );
+        assert_eq!(
+            resolved(&on, "email_address", "User"),
+            ("exact".into(), Some("schema.sql".into())),
+            "User.email -> users.email_address via the Column name= override, not 'email'"
+        );
+        let email_calls: i64 = on
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges WHERE callee_name='email'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(email_calls, 0, "the attribute name itself is never emitted when overridden");
+
+        // Persistence: same contract as sql_cte.
+        let reopened = Store::open(root).unwrap();
+        let v: i64 = reopened
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='orm_python'", [], |r| r.get::<_, String>(0))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(v, 1, "orm_python=on persisted across Store::open");
     }
 
     /// L3.3 — the actual origin question this wave exists to answer: `impact --diff` on a changed

@@ -330,6 +330,108 @@ fn ctor_name<'a>(n: Node, src: &'a [u8]) -> Option<&'a str> {
     (f.kind() == "identifier").then(|| text(f, src))
 }
 
+/// L3.5 (Phase C) — the constructor name for an ORM field's RHS call, handling both a bare
+/// identifier (`Column(...)`) and a qualified one (`db.Column(...)`) — unlike `ctor_name`
+/// (bare-identifier-only, used for regular OOP instance tracking), this needs the qualified form
+/// too since `from sqlalchemy import Column` vs `import sqlalchemy as sa; sa.Column(...)` are both
+/// common real-world styles.
+fn orm_ctor_name<'a>(n: Node, src: &'a [u8]) -> Option<&'a str> {
+    if n.kind() != "call" {
+        return None;
+    }
+    let f = n.child_by_field_name("function")?;
+    match f.kind() {
+        "identifier" => Some(text(f, src)),
+        "attribute" => f.child_by_field_name("attribute").map(|a| text(a, src)),
+        _ => None,
+    }
+}
+
+/// L3.5 (Phase C) — a `string` node's inner text (between the quotes). `None` for anything else,
+/// INCLUDING an f-string with a real interpolation — tree-sitter-python parses `f"prefix_{x}"` as
+/// the SAME `string` node kind as a plain literal (`string_start`/`string_content`/`string_end`,
+/// plus an `interpolation` child for the dynamic part) — found live via a spike after this
+/// wrongly returned `"prefix_"` for a computed table name; the `interpolation`-child check is what
+/// actually distinguishes a genuinely static string from a dynamic one here, never guess.
+fn string_literal_content<'a>(n: Node, src: &'a [u8]) -> Option<&'a str> {
+    if n.kind() != "string" {
+        return None;
+    }
+    let mut c = n.walk();
+    let children: Vec<Node> = n.named_children(&mut c).collect();
+    if children.iter().any(|ch| ch.kind() == "interpolation") {
+        return None;
+    }
+    children.iter().find(|ch| ch.kind() == "string_content").map(|ch| text(*ch, src))
+}
+
+/// L3.5 (Phase C) — a `Column(...)`/`mapped_column(...)` call's explicit column-name override: the
+/// first positional argument if it's a bare string literal (`Column("real_name", ...)`), or a
+/// `name=`/`db_column=` keyword argument's string value (SQLAlchemy and Django's respective
+/// conventions). `None` -> the field's own attribute name IS the column name, the ORM's own default
+/// when no override is given.
+fn orm_column_name_override<'a>(call: Node, src: &'a [u8]) -> Option<&'a str> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut c = args.walk();
+    for arg in args.named_children(&mut c) {
+        if arg.kind() == "string" {
+            return string_literal_content(arg, src);
+        }
+        if arg.kind() == "keyword_argument" {
+            let Some(kw_name) = arg.child_by_field_name("name") else { continue };
+            if matches!(text(kw_name, src), "name" | "db_column") {
+                if let Some(v) = arg.child_by_field_name("value") {
+                    if let Some(s) = string_literal_content(v, src) {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// L3.5 (Phase C) — a SQLAlchemy declarative model's own field -> column mapping: `__tablename__`'s
+/// literal string value, plus one (attribute name, real column name, line) per
+/// `field = Column(...)` / `field: Mapped[T] = mapped_column(...)` DIRECT class-body assignment.
+/// `__tablename__` must be a plain string literal — a computed/f-string value is honestly skipped,
+/// never guessed. Mixin-inherited fields (a base class contributing its own columns via multiple
+/// inheritance) are NOT walked here — out of scope for this first pass, see the `class_definition`
+/// arm's call site.
+fn orm_model_fields(body: Node, src: &[u8]) -> (Option<String>, Vec<(String, String, usize)>) {
+    let mut table = None;
+    let mut fields = Vec::new();
+    let mut c = body.walk();
+    for stmt in body.named_children(&mut c) {
+        if stmt.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(assign) = stmt.named_child(0).filter(|n| n.kind() == "assignment") else { continue };
+        let (Some(left), Some(right)) =
+            (assign.child_by_field_name("left"), assign.child_by_field_name("right"))
+        else {
+            continue;
+        };
+        if left.kind() != "identifier" {
+            continue;
+        }
+        let left_name = text(left, src);
+        if left_name == "__tablename__" {
+            if let Some(s) = string_literal_content(right, src) {
+                table = Some(s.to_lowercase());
+            }
+            continue;
+        }
+        if matches!(orm_ctor_name(right, src), Some("Column") | Some("mapped_column")) {
+            let col_name = orm_column_name_override(right, src)
+                .map(str::to_lowercase)
+                .unwrap_or_else(|| left_name.to_lowercase());
+            fields.push((left_name.to_string(), col_name, stmt.start_position().row + 1));
+        }
+    }
+    (table, fields)
+}
+
 fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
     let mut child_ctx = ctx;
     match node.kind() {
@@ -369,7 +471,8 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
                     (children.len() == 1 && children[0].kind() == "identifier")
                         .then(|| text(children[0], src).to_string())
                 });
-                let docstring = node.child_by_field_name("body").and_then(|b| extract_docstring(b, src));
+                let body_node = node.child_by_field_name("body");
+                let docstring = body_node.and_then(|b| extract_docstring(b, src));
                 state.out.defs.push(Definition {
                     name: nm.to_string(),
                     kind: "class".into(),
@@ -381,6 +484,25 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
                     base_class,
                     docstring,
                 });
+                // L3.5 (Phase C) — a SQLAlchemy declarative model (signaled by its own
+                // `__tablename__` literal, the canonical marker — avoids false positives on an
+                // unrelated class that happens to have an attribute or method named Column):
+                // extract one `orm-map` call per direct field, caller = this class's own def, so
+                // it resolves via the SAME `enclosing`-name lookup every other call already uses.
+                if let Some(body) = body_node {
+                    let (table, fields) = orm_model_fields(body, src);
+                    if let Some(table) = table {
+                        for (_field, col, line) in fields {
+                            state.out.calls.push(CallSite {
+                                name: col,
+                                kind: "orm-map".into(),
+                                line,
+                                enclosing: nm.to_string(),
+                                receiver_class: Some(table.clone()),
+                            });
+                        }
+                    }
+                }
                 child_ctx = Ctx { method_class: Some(nm), ..ctx };
             }
         }
@@ -898,5 +1020,87 @@ class G:
         assert_eq!(base_of("E"), None, "multiple bases -> no binding");
         assert_eq!(base_of("F"), None, "metaclass kwarg -> no binding");
         assert_eq!(base_of("G"), None, "no superclasses -> no binding");
+    }
+
+    // ---- L3.5: Phase C ORM field->column extraction ----
+
+    fn orm_calls(p: &ParsedFile) -> Vec<&CallSite> {
+        p.calls.iter().filter(|c| c.kind == "orm-map").collect()
+    }
+
+    #[test]
+    fn orm_classic_column_style_with_and_without_name_override() {
+        let src = "\
+from sqlalchemy import Column, Integer, String
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    username = Column(\"uname\", String(100))
+";
+        let p = parse_python(src).unwrap();
+        let calls = orm_calls(&p);
+        assert_eq!(calls.len(), 2);
+        let id = calls.iter().find(|c| c.name == "id").expect("id column");
+        assert_eq!(id.receiver_class.as_deref(), Some("users"));
+        assert_eq!(id.enclosing, "User");
+        let uname = calls.iter().find(|c| c.name == "uname").expect("name override used, not 'username'");
+        assert_eq!(uname.receiver_class.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn orm_modern_mapped_column_style() {
+        let src = "\
+from typing import Optional
+from sqlalchemy import String, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Job(SqlalchemyBase):
+    __tablename__ = \"jobs\"
+    status: Mapped[str] = mapped_column(String, default=\"created\")
+    organization_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey(\"organizations.id\"))
+";
+        let p = parse_python(src).unwrap();
+        let calls = orm_calls(&p);
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().any(|c| c.name == "status" && c.receiver_class.as_deref() == Some("jobs")));
+        assert!(calls.iter().any(|c| c.name == "organization_id" && c.receiver_class.as_deref() == Some("jobs")));
+    }
+
+    #[test]
+    fn orm_relationship_and_non_model_class_are_not_extracted() {
+        let src = "\
+from sqlalchemy.orm import relationship
+
+class Order(Base):
+    __tablename__ = 'orders'
+    id = Column(Integer, primary_key=True)
+    items = relationship(\"Item\", back_populates=\"order\")
+
+class PlainHelper:
+    id = Column(Integer)
+";
+        let p = parse_python(src).unwrap();
+        let calls = orm_calls(&p);
+        assert!(calls.iter().all(|c| c.name != "items"), "relationship() is not a column");
+        assert!(
+            calls.iter().all(|c| c.enclosing != "PlainHelper"),
+            "no __tablename__ -> not treated as a model"
+        );
+        assert!(calls.iter().any(|c| c.name == "id" && c.enclosing == "Order"));
+    }
+
+    #[test]
+    fn orm_dynamic_tablename_is_skipped_never_guessed() {
+        let src = "\
+class Weird(Base):
+    __tablename__ = f\"prefix_{suffix}\"
+    id = Column(Integer, primary_key=True)
+";
+        let p = parse_python(src).unwrap();
+        assert!(orm_calls(&p).is_empty(), "f-string tablename -> honest skip, not a guess");
     }
 }

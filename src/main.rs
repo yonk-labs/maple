@@ -45,6 +45,11 @@ enum Cmd {
         /// implies --sql-columns (a CTE read resolves against real column defs, which need it on).
         #[arg(long, default_value_t = false)]
         with_sql_cte: bool,
+        /// L3.5 (Phase C, SQLAlchemy only) — resolve a Python ORM model field against the real
+        /// schema column it maps to (via `__tablename__` + `Column`/`mapped_column`). Off by
+        /// default; implies --sql-columns.
+        #[arg(long, default_value_t = false)]
+        orm_python: bool,
     },
     /// Cold full index of a repo into <repo>/.maple/graph.db.
     Index {
@@ -64,6 +69,11 @@ enum Cmd {
         /// column defs, which need it on).
         #[arg(long, default_value_t = false)]
         with_sql_cte: bool,
+        /// L3.5 (Phase C, SQLAlchemy only) — resolve a Python ORM model field against the real
+        /// schema column it maps to. Off by default, persisted like --sql-columns; implies
+        /// --sql-columns.
+        #[arg(long, default_value_t = false)]
+        orm_python: bool,
     },
     /// Read counts from an existing store without parsing (no reindex, just reports what's there).
     Status { repo: String },
@@ -272,20 +282,23 @@ fn refresh_note(s: &mut store::Store) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Parse { path, sql_dialect, sql_columns, with_sql_cte } => {
+        Cmd::Parse { path, sql_dialect, sql_columns, with_sql_cte, orm_python } => {
             let dialect = sql_dialect.as_deref().map(parser::SqlDialect::parse).transpose()?;
             let lang = require_supported(&path, dialect)?;
             let src = fs::read_to_string(&path)?;
             let mut parsed = (lang.parse)(&src)?;
-            if !(sql_columns || with_sql_cte) {
+            if !(sql_columns || with_sql_cte || orm_python) {
                 parsed.defs.retain(|d| d.kind != "table" && d.kind != "column");
             }
             if with_sql_cte {
                 store::apply_cte_columns(&mut parsed);
             }
+            if !orm_python {
+                parsed.calls.retain(|c| c.kind != "orm-map");
+            }
             println!("{}", serde_json::to_string_pretty(&parsed)?);
         }
-        Cmd::Index { repo, sql_dialect, sql_columns, with_sql_cte } => {
+        Cmd::Index { repo, sql_dialect, sql_columns, with_sql_cte, orm_python } => {
             let root = Path::new(&repo);
             let mut s = store::Store::open(root)?;
             if let Some(d) = sql_dialect.as_deref() {
@@ -296,11 +309,14 @@ fn main() -> anyhow::Result<()> {
             // "not passed" from "explicitly false" the way sql_dialect's Option<String> can, so
             // there's currently no CLI path back to off once a repo has opted in; delete .maple
             // and reindex if that's ever needed.
-            if sql_columns || with_sql_cte {
+            if sql_columns || with_sql_cte || orm_python {
                 s.set_sql_columns(true)?;
             }
             if with_sql_cte {
                 s.set_sql_cte(true)?;
+            }
+            if orm_python {
+                s.set_orm_python(true)?;
             }
             let st = s.index_repo(root)?;
             println!(

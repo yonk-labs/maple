@@ -410,6 +410,41 @@ table-valued functions) cost some extraction — affected files are flagged in `
 the graph always reports its holes (measured ~87% file-level proc recall on Microsoft's
 WideWorldImporters).
 
+## Column-level lineage (Wave L3, opt-in)
+
+Beyond the universal tier, maple can track "what reads/writes this column, all the way from schema
+to application code" — every layer is opt-in and off by default (new, unvalidated behavior shipped
+dark until proven out on real corpora). Each flag persists in the store the same way
+`--sql-dialect` does, so `refresh` inherits it without repeating the flag.
+
+- **`--sql-columns`** — adds two new symbol kinds: `table` and `column`, extracted from
+  `CREATE TABLE` (all 3 SQL dialects). `--with-sql-cte` and `--orm-python` both imply this: neither
+  has anything real to resolve against without it.
+- **`--sql-columns` alone** additionally extracts DML column references (`SELECT`/`WHERE`/`JOIN`
+  reads, `INSERT`/`UPDATE`/`column :=` writes) inside procedure/function/trigger bodies and
+  top-level scripts, as new call kinds `read`/`write`. An unqualified column resolves via the
+  FROM/JOIN table set: exactly one candidate table defines it → `exact`; 2+ → `ambiguous` (never
+  guessed); none → `unresolved` (could be a CTE, temp table, or an unindexed table).
+- **`--with-sql-cte`** (T-SQL, Postgres, PL/SQL) — resolves a `WITH x AS (...)` CTE-scoped read
+  against the REAL table/column it re-projects, instead of leaving it unresolved against a
+  `parent_class` that's just a CTE name with no schema behind it. Only a CTE column that's a
+  direct, untransformed passthrough of a real column gets resolved (`col`, `t.col`, `t.col AS
+  alias`); a window function, aggregate, expression, or `*` — or a CTE body ambiguous between two
+  underlying tables — is left honestly unresolved, never guessed.
+- **`--orm-python`** (SQLAlchemy only; Django deferred, no real corpus to validate it against yet)
+  — a declarative model's field → column mapping as a new call kind, `orm-map`: `class User(Base):
+  __tablename__ = "users"; id = Column(...)` (classic) and `id: Mapped[int] = mapped_column(...)`
+  (SQLAlchemy 2.0) both extract, using an explicit `Column("real_name", ...)` /
+  `name=`/`db_column=` override when present, else the attribute's own name. This is the ONE
+  deliberate cross-language edge in the whole graph (caller = a Python `class`, callee = a SQL
+  `column`) — every other resolution path stays strictly same-language by design.
+  **Scope boundary, not an implementation detail:** raw embedded SQL strings
+  (`cursor.execute(f"...")`, template-literal SQL) are explicitly OUT OF SCOPE — string
+  interpolation makes the real runtime SQL unknowable at parse time, and guessing here would break
+  the never-guess contract the whole trust model depends on. `relationship()`/association fields
+  and mixin-inherited columns are not walked (v1 scope: a model's own direct `Column`/
+  `mapped_column` fields only).
+
 ## Status
 
 Spec, plan, and evidence live in `spec/code-symbol-graph/`.
