@@ -18,7 +18,78 @@
 
 use crate::langs::{find_child, tree_for, walk_children};
 use crate::parser::{first_line, text, CallSite, Definition, ParsedFile};
+use std::collections::HashMap;
 use tree_sitter::{Node, Parser, Tree};
+
+// ---- L3.3: shared DML column-reference helpers (all three dialects) -----------
+
+/// Every `kind`-matching descendant, EXCEPT inside a nested statement of a kind in `stop_at` — a
+/// subquery's column references belong to ITS OWN scope, not the enclosing statement's; that
+/// nested statement gets its own correctly-scoped extraction when the top-level walk's normal
+/// recursion reaches it. Without this boundary, `SELECT a FROM t WHERE x IN (SELECT b FROM u)`
+/// would misattribute `b` to `t`'s scope instead of `u`'s.
+fn find_descendants_scoped<'t>(node: Node<'t>, kind: &str, stop_at: &[&str]) -> Vec<Node<'t>> {
+    fn walk<'t>(node: Node<'t>, kind: &str, stop_at: &[&str], out: &mut Vec<Node<'t>>) {
+        let mut c = node.walk();
+        for child in node.named_children(&mut c) {
+            if child.kind() == kind {
+                out.push(child); // a column-ref node never nests another one — no need to recurse in
+                continue;
+            }
+            if stop_at.contains(&child.kind()) {
+                continue;
+            }
+            walk(child, kind, stop_at, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, kind, stop_at, &mut out);
+    out
+}
+
+/// Resolve a column reference's table scope: a qualifier (table alias/name) looks itself up in
+/// `scope`, falling back to its own (normed) text if it isn't a known alias — still a concrete,
+/// non-guessed answer (the qualifier IS syntactically a real name, just not one this statement's
+/// FROM/JOIN happens to bind — e.g. a linked-server or cross-database prefix). No qualifier -> every
+/// table currently in scope, deduped and `\x1f`-joined — the store resolves exact/ambiguous/
+/// unresolved from that set by checking real column membership; the walk never decides that itself.
+/// Empty scope (couldn't determine ANY table context) -> None: honest omission, not a guess.
+fn scope_receiver(scope: &HashMap<String, String>, qualifier: Option<&str>) -> Option<String> {
+    match qualifier {
+        Some(q) => Some(scope.get(&norm(q)).cloned().unwrap_or_else(|| norm(q))),
+        None => {
+            let mut names: Vec<&str> = scope.values().map(String::as_str).collect();
+            names.sort();
+            names.dedup();
+            (!names.is_empty()).then(|| names.join("\u{1f}"))
+        }
+    }
+}
+
+/// Emit one column-reference `CallSite`. Deliberately NOT routed through `push_call` — its
+/// builtin-name filter exists for function names, not column names, and would be a category error
+/// here (a column genuinely named `count` or `left` is common and not a builtin call).
+fn push_column_ref(
+    out: &mut ParsedFile,
+    raw_name: &str,
+    access: &str,
+    receiver_class: Option<String>,
+    line: usize,
+    enclosing: &str,
+) {
+    let Some(receiver_class) = receiver_class else { return };
+    let name = norm(raw_name);
+    if name.is_empty() {
+        return;
+    }
+    out.calls.push(CallSite {
+        name,
+        kind: access.into(),
+        line,
+        enclosing: enclosing.to_string(),
+        receiver_class: Some(receiver_class),
+    });
+}
 
 /// SQL identifiers are case-insensitive (pg folds down, Oracle/T-SQL fold up) — lowercase every
 /// def/call/parent name at extraction. Quoting (`"X"`, `[X]`, backticks) is stripped and quoted
@@ -261,6 +332,87 @@ fn obj_ref_parts<'a>(node: Node, src: &'a [u8]) -> (Option<&'a str>, Option<&'a 
     )
 }
 
+/// L3.3 — nested-statement boundaries a DML column-ref/table-scope walk must stop at, so a
+/// subquery's own tables/columns never leak into the enclosing statement's scope. `subquery` is
+/// its own wrapper node (its `select` and that select's `from` are SIBLINGS under `subquery`, the
+/// same sibling shape the top-level `statement` uses) — without it in this list, a walk that
+/// correctly stops at `select` still recurses into `subquery` -> `from` and leaks the inner
+/// table(s) into the outer scope (caught live by `tsql_subquery_gets_its_own_scope_not_the_outer_ones`).
+const DML_STOP: &[&str] = &["subquery", "select", "update", "insert", "delete"];
+
+/// L3.3 — alias/name -> real (bare, schema-dropped) table name for every `relation` under a tsql
+/// FROM clause's subtree (base table + every JOIN), plus a self-mapped entry for DELETE's bare
+/// target (a direct `object_reference`, no `relation` wrapper). Bare, schema-dropped, because
+/// that's exactly what Phase A stores as a column's `parent_class` — this map's values must match
+/// it exactly for scope resolution to find real column defs later.
+fn tsql_table_scope(node: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut scope = HashMap::new();
+    for rel in find_descendants_scoped(node, "relation", DML_STOP) {
+        if let Some(or) = find_child(rel, "object_reference") {
+            if let Some(nm) = or.child_by_field_name("name") {
+                let table = norm(text(nm, src));
+                scope.insert(table.clone(), table.clone());
+                if let Some(alias) = rel.child_by_field_name("alias") {
+                    scope.insert(norm(text(alias, src)), table);
+                }
+            }
+        }
+    }
+    if scope.is_empty() {
+        // DELETE FROM t (no relation wrapper) or UPDATE t (relation wraps it, already handled
+        // above) — check for a bare object_reference as the sole remaining shape.
+        if let Some(or) = find_child(node, "object_reference") {
+            if let Some(nm) = or.child_by_field_name("name") {
+                let table = norm(text(nm, src));
+                scope.insert(table.clone(), table);
+            }
+        }
+    }
+    scope
+}
+
+/// L3.3 — a tsql `field` node's own column name plus its optional qualifier (the `name:` of a
+/// nested `object_reference`, e.g. `o` in `o.status`).
+fn tsql_field_parts<'a>(field: Node, src: &'a [u8]) -> (Option<&'a str>, Option<&'a str>) {
+    let qualifier = find_child(field, "object_reference")
+        .and_then(|or| or.child_by_field_name("name"))
+        .map(|n| text(n, src));
+    let column = field.child_by_field_name("name").map(|n| text(n, src));
+    (qualifier, column)
+}
+
+/// L3.3 — every column reference (`field` node) under `node`, resolved against `scope`, emitted
+/// as `access` ("read"/"write"). Stops at nested-statement boundaries (see
+/// `find_descendants_scoped`) so a subquery's fields aren't misattributed to this scope.
+/// `find_descendants_scoped` only matches DESCENDANTS, never `node` itself — include it directly
+/// when the caller passes a bare `field` node (e.g. an UPDATE assignment's `right:` when it's an
+/// unqualified column copy, `SET total = price`, which the grammar doesn't wrap in a container).
+fn push_tsql_field_refs(
+    out: &mut ParsedFile,
+    node: Node,
+    src: &[u8],
+    scope: &HashMap<String, String>,
+    access: &str,
+    enclosing: &str,
+) {
+    let mut fields = find_descendants_scoped(node, "field", DML_STOP);
+    if node.kind() == "field" {
+        fields.insert(0, node);
+    }
+    for f in fields {
+        let (qualifier, column) = tsql_field_parts(f, src);
+        let Some(col) = column else { continue };
+        push_column_ref(
+            out,
+            col,
+            access,
+            scope_receiver(scope, qualifier),
+            f.start_position().row + 1,
+            enclosing,
+        );
+    }
+}
+
 fn walk_tsql(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, in_error: bool) {
     let in_error = entering_error(node, in_error);
     let mut def_name: Option<String> = None;
@@ -323,6 +475,95 @@ fn walk_tsql(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, in_e
                 if let Some(nm) = name {
                     let kind = if schema.is_some() { "method" } else { "func" };
                     push_call(out, TSQL_BUILTINS, nm, kind, node.start_position().row + 1, enclosing);
+                }
+            }
+        }
+        // L3.3: SELECT list + JOIN-ON + WHERE column references, all reads. `from` is a SIBLING
+        // of `select`, both under `statement` for a top-level query OR under `subquery` for a
+        // nested one (same sibling shape either way — `subquery` is why it's also in `DML_STOP`;
+        // this arm is what actually gives a nested subquery its own correctly-scoped extraction
+        // once the outer walk's `DML_STOP` boundary is crossed by the normal recursion below).
+        // Matched here the same way DELETE is below, guarded on having a `select` child rather
+        // than matching `select` directly, so both siblings are reachable without a parent-pointer
+        // walk. Two separate extraction calls, each rooted at the right node (never at `statement`/
+        // `subquery` itself, which would incorrectly trip the nested-subquery stop-list on the
+        // select being processed right now).
+        "statement" | "subquery" if find_child(node, "select").is_some() => {
+            let select = find_child(node, "select").unwrap();
+            let from = find_child(node, "from");
+            let scope = from.map(|f| tsql_table_scope(f, src)).unwrap_or_default();
+            push_tsql_field_refs(out, select, src, &scope, "read", enclosing);
+            if let Some(from) = from {
+                push_tsql_field_refs(out, from, src, &scope, "read", enclosing);
+            }
+        }
+        // UPDATE: SET target = write; SET source expression + WHERE = reads. A plain (non-FROM)
+        // UPDATE's scope is exactly its one target table, so an unqualified SET target correctly
+        // resolves via the same `scope_receiver` logic every other column ref uses — no special
+        // casing needed for "the" table being updated.
+        "update" if !in_error => {
+            let scope = tsql_table_scope(node, src);
+            for assign in find_descendants_scoped(node, "assignment", DML_STOP) {
+                if let Some(left) = assign.child_by_field_name("left") {
+                    if left.kind() == "field" {
+                        let (qualifier, column) = tsql_field_parts(left, src);
+                        if let Some(col) = column {
+                            push_column_ref(
+                                out,
+                                col,
+                                "write",
+                                scope_receiver(&scope, qualifier),
+                                left.start_position().row + 1,
+                                enclosing,
+                            );
+                        }
+                    }
+                }
+                if let Some(right) = assign.child_by_field_name("right") {
+                    push_tsql_field_refs(out, right, src, &scope, "read", enclosing);
+                }
+            }
+            if let Some(w) = find_child(node, "where") {
+                push_tsql_field_refs(out, w, src, &scope, "read", enclosing);
+            }
+        }
+        // INSERT: the column list is a write to the single target table — no alias resolution
+        // needed (INSERT never joins). Values themselves are literals/expressions, not tracked.
+        "insert" if !in_error => {
+            if let Some(or) = find_child(node, "object_reference") {
+                if let Some(nm) = or.child_by_field_name("name") {
+                    let table = norm(text(nm, src));
+                    let mut scope = HashMap::new();
+                    scope.insert(table.clone(), table);
+                    if let Some(cols) = find_child(node, "list") {
+                        walk_children(cols, |c| {
+                            if c.kind() == "column" {
+                                if let Some(id) = c.named_child(0) {
+                                    push_column_ref(
+                                        out,
+                                        text(id, src),
+                                        "write",
+                                        scope_receiver(&scope, None),
+                                        id.start_position().row + 1,
+                                        enclosing,
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        // DELETE: `delete` and `from` are SIBLINGS under `statement` (unlike SELECT/UPDATE, where
+        // FROM is nested inside the statement node) — matched here, guarded on having a `delete`
+        // child, rather than on `delete` itself, so no parent-pointer walk is needed. Only a WHERE
+        // to read from; the target table is the bare `object_reference` `tsql_table_scope`'s
+        // fallback branch handles (no `relation` wrapper for a plain DELETE).
+        "statement" if find_child(node, "delete").is_some() => {
+            if let Some(from) = find_child(node, "from") {
+                let scope = tsql_table_scope(from, src);
+                if let Some(w) = find_child(from, "where") {
+                    push_tsql_field_refs(out, w, src, &scope, "read", enclosing);
                 }
             }
         }
@@ -952,6 +1193,97 @@ GO
         let status = p.defs.iter().find(|d| d.name == "status" && d.kind == "column").expect("status column");
         assert_eq!(status.parent_class.as_deref(), Some("t"));
         assert_eq!(p.defs.len(), 3, "table + 2 columns, nothing else");
+    }
+
+    // ---- L3.3: tsql DML column references ----
+
+    fn find_col<'a>(p: &'a ParsedFile, name: &str, access: &str) -> &'a CallSite {
+        p.calls
+            .iter()
+            .find(|c| c.name == name && c.kind == access)
+            .unwrap_or_else(|| panic!("no {access} ref to {name} in {:?}", p.calls))
+    }
+
+    #[test]
+    fn tsql_select_qualified_and_unqualified_reads() {
+        let p = parse_tsql(
+            "SELECT o.status, total FROM orders o WHERE o.id = 5 AND total > 0;\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        // `total` is unqualified with exactly one table in scope -> that table, not ambiguous.
+        // (Multiple appearances of `total` — SELECT list and WHERE — both resolve the same way.)
+        assert!(p
+            .calls
+            .iter()
+            .filter(|c| c.name == "total" && c.kind == "read")
+            .all(|c| c.receiver_class.as_deref() == Some("orders")));
+    }
+
+    #[test]
+    fn tsql_join_widens_unqualified_scope_for_ambiguity_check_later() {
+        // The walk never decides exact/ambiguous itself — it emits the full candidate set and the
+        // store resolves it. Two tables in scope -> both names present, delimiter-joined.
+        let p = parse_tsql(
+            "SELECT status FROM orders o JOIN order_items oi ON o.id = oi.order_id WHERE status = 'open';\n",
+        )
+        .unwrap();
+        let scope = find_col(&p, "status", "read").receiver_class.clone().unwrap();
+        let mut names: Vec<&str> = scope.split('\u{1f}').collect();
+        names.sort();
+        assert_eq!(names, vec!["order_items", "orders"]);
+        // Qualified refs in the JOIN's ON clause resolve to their own single table, unaffected.
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "order_id", "read").receiver_class.as_deref(), Some("order_items"));
+    }
+
+    #[test]
+    fn tsql_update_set_target_is_write_where_is_read() {
+        let p = parse_tsql("UPDATE orders SET status = 'closed', total = price WHERE id = 5;\n").unwrap();
+        assert_eq!(find_col(&p, "status", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "total", "write").receiver_class.as_deref(), Some("orders"));
+        // `price` on the right of `total = price` is a read (copying one column into another).
+        assert_eq!(find_col(&p, "price", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn tsql_insert_column_list_is_write() {
+        let p = parse_tsql("INSERT INTO orders (id, status) VALUES (1, 'open');\n").unwrap();
+        assert_eq!(find_col(&p, "id", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "status", "write").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn tsql_delete_where_is_read() {
+        let p = parse_tsql("DELETE FROM orders WHERE status = 'closed';\n").unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn tsql_subquery_gets_its_own_scope_not_the_outer_ones() {
+        // A naive "collect every field under the outer SELECT" would misattribute `total` (inside
+        // the subquery, scoped to order_items) to orders' scope. The stop-at-nested-statement
+        // boundary must prevent that.
+        let p = parse_tsql(
+            "SELECT status FROM orders WHERE id IN (SELECT order_id FROM order_items WHERE total > 100);\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "order_id", "read").receiver_class.as_deref(), Some("order_items"));
+        assert_eq!(find_col(&p, "total", "read").receiver_class.as_deref(), Some("order_items"));
+    }
+
+    #[test]
+    fn tsql_sql_columns_off_never_reaches_dml_walk_via_default_gate() {
+        // Belt-and-suspenders: the store-level gate (parse_one_file) is what actually turns this
+        // off by default (tested in store.rs); this just confirms the walk itself has no separate
+        // opt-out and always extracts when called directly, so the gate is the ONLY place this is
+        // controlled — no risk of two disagreeing switches.
+        let p = parse_tsql("SELECT status FROM orders;\n").unwrap();
+        assert!(!p.calls.is_empty(), "walk layer always extracts; store.rs gates it");
     }
 
     // ---- PL/SQL ----
