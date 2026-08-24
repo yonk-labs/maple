@@ -1682,10 +1682,23 @@ fn pg_plpgsql_body(body: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str
     }
 }
 
-/// Extract calls from one SQL fragment: parse as statement text first (covers plpgsql
-/// `stmt_execsql` bodies like `SELECT ... INTO ...`), else wrapped as `SELECT <expr>;` (covers
-/// PERFORM/CALL/IF/assignment expressions — the prefix adds no rows, and rows are all we record).
-/// Fragments that parse neither way are skipped: no call-site is invented (never guess).
+/// Extract from one SQL fragment: parse as statement text first (covers plpgsql `stmt_execsql`
+/// bodies like `SELECT ... INTO ...`), else wrapped as `SELECT <expr>;` (covers PERFORM/CALL/IF/
+/// assignment expressions — the prefix adds no rows, and rows are all we record). Fragments that
+/// parse neither way are skipped: nothing is invented (never guess).
+///
+/// L3.3/L3.4 fix: this used to hand-walk the fragment's tree looking ONLY for `func_application`,
+/// bypassing `walk_pg` entirely — which meant a plpgsql body's own SELECT/UPDATE/INSERT/DELETE
+/// column reads (Phase B) and CTE lineage (L3.4) were NEVER extracted, independent of either
+/// feature, since neither's match arm ever ran on fragment text. Found live dogfooding L3.4: a
+/// plain non-CTE `SELECT status INTO v FROM orders` inside a function body produced zero edges,
+/// while the identical statement at top level worked fine. Now re-walks the fragment through the
+/// SAME dispatcher top-level statements use, giving full parity — `func_application` extraction is
+/// unaffected (walk_pg's own arm for it is byte-identical to the one this replaced) plus every
+/// other statement kind Phase B/L3.4 already handle now reaches inside function bodies too.
+/// `walk_pg`'s line numbers are fragment-relative (rows from the fragment's OWN parse root); shift
+/// every def/call this call adds by `base_row` afterward — the same offset the old code added
+/// inline per push.
 fn pg_sql_fragment(fragment: &str, base_row: usize, out: &mut ParsedFile, enclosing: &str, ps: &mut PgParsers) {
     if fragment.trim().is_empty() {
         return;
@@ -1702,17 +1715,14 @@ fn pg_sql_fragment(fragment: &str, base_row: usize, out: &mut ParsedFile, enclos
         }
     };
     let src = text_owned.as_bytes();
-    let mut stack = vec![tree.root_node()];
-    while let Some(n) = stack.pop() {
-        if n.kind() == "func_application" {
-            if let Some(fname) = find_child(n, "func_name") {
-                pg_push_func(out, text(fname, src), base_row + n.start_position().row + 1, enclosing);
-            }
-        }
-        let mut c = n.walk();
-        for child in n.named_children(&mut c) {
-            stack.push(child);
-        }
+    let (defs_before, calls_before) = (out.defs.len(), out.calls.len());
+    walk_pg(tree.root_node(), src, out, enclosing, ps, false);
+    for d in &mut out.defs[defs_before..] {
+        d.start_line += base_row;
+        d.end_line += base_row;
+    }
+    for c in &mut out.calls[calls_before..] {
+        c.line += base_row;
     }
 }
 
@@ -2253,6 +2263,35 @@ CREATE FUNCTION plain_sql(x int) RETURNS int AS $$ SELECT order_total(x) $$ LANG
         // builtins skipped
         assert!(!p.calls.iter().any(|c| c.name == "sum"));
         assert!(p.symbolless_ok);
+    }
+
+    /// L3.3 review fix — `pg_sql_fragment` used to hand-walk fragment trees for `func_application`
+    /// ONLY, bypassing `walk_pg`'s Phase B column-ref arms entirely: a plpgsql body's own
+    /// SELECT/UPDATE/etc column reads were never extracted at all, independent of any dialect or
+    /// feature. Same fixture as `pg_plpgsql_body_calls_with_correct_lines` — its line-5
+    /// `SELECT sum(amount) INTO t FROM order_lines WHERE order_id = oid` now also yields column
+    /// reads for `amount` (a genuine column even though it's a `sum()` argument, unlike the
+    /// function NAME itself) and `order_id`, both scoped to `order_lines`, at the correct absolute
+    /// line — proving the fragment-relative-to-absolute line shift survived the rewrite too.
+    #[test]
+    fn pg_plpgsql_body_own_select_into_columns_are_extracted() {
+        let src = "\
+CREATE OR REPLACE FUNCTION order_total(oid int) RETURNS numeric AS $$
+DECLARE
+  t numeric;
+BEGIN
+  SELECT sum(amount) INTO t FROM order_lines WHERE order_id = oid;
+  RETURN t;
+END;
+$$ LANGUAGE plpgsql;
+";
+        let p = parse_postgres(src).unwrap();
+        let amount = p.calls.iter().find(|c| c.name == "amount" && c.kind == "read").expect("amount read");
+        assert_eq!(amount.receiver_class.as_deref(), Some("order_lines"));
+        assert_eq!(amount.line, 5);
+        let order_id = p.calls.iter().find(|c| c.name == "order_id" && c.kind == "read").expect("order_id read");
+        assert_eq!(order_id.receiver_class.as_deref(), Some("order_lines"));
+        assert_eq!(order_id.line, 5);
     }
 
     #[test]
