@@ -152,7 +152,7 @@ instead — see their entries below.
 | Command | What it does |
 |---|---|
 | `maple parse <file>` | Parse one source file (any supported language), print its extracted defs/calls/imports as JSON. |
-| `maple index <repo>` | Cold full index of a repo into `<repo>/.maple/graph.db`. |
+| `maple index <repo>` | Cold full index of a repo into `<repo>/.maple/graph.db`. `--sql-dialect postgres\|tsql\|plsql` for `.sql` files; `--sql-columns`/`--with-sql-cte`/`--orm-python` opt into column-level lineage (see [Column-level lineage](#column-level-lineage-wave-l3-opt-in)). |
 | `maple status <repo>` | Print counts from an existing store without parsing anything. |
 | `maple closure <repo> --symbol <spec>` | Depth-1 closure: target definition(s) plus direct callers and callees. |
 | `maple enumerate <repo> --symbol <spec>` | "N callers across M files" plus an exact/ambiguous/unresolved breakdown. |
@@ -170,6 +170,18 @@ Examples:
 maple parse src/pkg/mod.py
 
 maple index /path/to/repo
+
+# .sql files need a dialect — postgres, tsql, or plsql (Oracle-only extensions never need it)
+maple index /path/to/repo --sql-dialect postgres
+
+# + column-level lineage: CREATE TABLE -> DML reads/writes, all opt-in, off by default
+maple index /path/to/repo --sql-dialect tsql --sql-columns
+
+# + resolve a WITH-clause CTE-scoped read against the real table/column it re-projects
+maple index /path/to/repo --sql-dialect postgres --with-sql-cte
+
+# + a SQLAlchemy model field resolves against the real schema column it maps to (cross-language)
+maple index /path/to/repo --sql-dialect postgres --sql-columns --orm-python
 
 maple status /path/to/repo
 
