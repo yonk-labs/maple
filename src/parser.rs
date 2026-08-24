@@ -10,6 +10,7 @@
 //! (it alone feeds the S2 exact resolver); the 8 universal-tier walks live in `crate::langs`.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
@@ -171,6 +172,14 @@ pub struct ParsedFile {
     /// for the store's suspect check, never serialized.
     #[serde(skip)]
     pub symbolless_ok: bool,
+    /// L3.4 (CTE lineage) — CTE name -> {output column name -> (real table, real column)}, built
+    /// unconditionally by the SQL walks for every `WITH name AS (...)` whose body directly
+    /// re-projects a real table's column with no transformation (bare `col`, `t.col`, or
+    /// `t.col AS alias`). Applied by the store only when `--with-sql-cte` is on (see
+    /// `Store::sql_cte`) — same "walk stays unconditional, storage-policy gate" split as
+    /// `sql_columns`. Internal, never serialized.
+    #[serde(skip)]
+    pub cte_columns: HashMap<String, HashMap<String, (String, String)>>,
 }
 
 /// walk context: enclosing fn (call attribution), method_class (set only for the immediate class

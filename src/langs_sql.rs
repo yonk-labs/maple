@@ -413,8 +413,73 @@ fn push_tsql_field_refs(
     }
 }
 
+/// L3.4 (CTE lineage) — for every `cte` child of `stmt` (`WITH name[(cols)] AS (SELECT ...)`,
+/// comma-chained siblings under the same `statement`), its output-column projections: output name
+/// -> (real table, real column), one entry per select-list item that's a direct, untransformed
+/// passthrough of a real table's column (bare `col`, `t.col`, or `t.col AS alias`) — resolved
+/// against the CTE body's OWN table scope (`tsql_table_scope`, the same helper the body's own
+/// SELECT already uses). An explicit column list (`WITH x(a,b) AS (...)`) overrides the derived
+/// output names positionally. Anything else (window function, aggregate, expression, `*`, or a body
+/// scope ambiguous between two tables) has no entry — its outer references stay unresolved exactly
+/// as they were before this feature existed; never guess.
+/// ponytail: keyed by CTE name only (no statement-local scoping) — two same-named CTEs with
+/// different meanings in the same file collide (first one found wins). Rare in practice (repo-wide
+/// collision across whole DIFFERENT files is already fine, this only bites two WITH-blocks in one
+/// file reusing a generic name like `tmp`); revisit only if a real corpus hits it.
+fn tsql_cte_projections(stmt: Node, src: &[u8]) -> HashMap<String, HashMap<String, (String, String)>> {
+    let mut out = HashMap::new();
+    let mut cursor = stmt.walk();
+    for cte in stmt.children(&mut cursor).filter(|c| c.kind() == "cte") {
+        let Some(name_node) = cte.child(0) else { continue };
+        if name_node.kind() != "identifier" {
+            continue;
+        }
+        let cte_name = norm(text(name_node, src));
+        let explicit_cols: Vec<String> = {
+            let mut c2 = cte.walk();
+            cte.children_by_field_name("argument", &mut c2).map(|n| norm(text(n, src))).collect()
+        };
+        let Some(body) = find_child(cte, "statement") else { continue };
+        let Some(body_select) = find_child(body, "select") else { continue };
+        let body_scope = find_child(body, "from").map(|f| tsql_table_scope(f, src)).unwrap_or_default();
+        let Some(sel_expr) = find_child(body_select, "select_expression") else { continue };
+        let mut proj = HashMap::new();
+        let mut c3 = sel_expr.walk();
+        let terms = sel_expr.children(&mut c3).filter(|c| c.kind() == "term");
+        for (idx, term) in terms.enumerate() {
+            let value = term.child_by_field_name("value");
+            let alias = term.child_by_field_name("alias").map(|n| norm(text(n, src)));
+            let derived_name = value
+                .filter(|v| v.kind() == "field")
+                .and_then(|v| tsql_field_parts(v, src).1)
+                .map(norm);
+            let out_name = explicit_cols.get(idx).cloned().or(alias).or(derived_name);
+            let (Some(out_name), Some(value)) = (out_name, value) else { continue };
+            if value.kind() != "field" {
+                continue; // expression/function/window/*, not a bare passthrough
+            }
+            let (qualifier, column) = tsql_field_parts(value, src);
+            let Some(column) = column else { continue };
+            let Some(real_table) = scope_receiver(&body_scope, qualifier) else { continue };
+            if real_table.contains('\u{1f}') {
+                continue; // ambiguous underlying table, never guess
+            }
+            proj.insert(out_name, (real_table, norm(column)));
+        }
+        if !proj.is_empty() {
+            out.entry(cte_name).or_insert(proj);
+        }
+    }
+    out
+}
+
 fn walk_tsql(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, in_error: bool) {
     let in_error = entering_error(node, in_error);
+    if node.kind() == "statement" {
+        for (k, v) in tsql_cte_projections(node, src) {
+            out.cte_columns.entry(k).or_insert(v);
+        }
+    }
     let mut def_name: Option<String> = None;
     match node.kind() {
         "create_procedure" | "create_function" | "alter_procedure" | "alter_function" => {
@@ -1671,6 +1736,51 @@ GO
         // controlled — no risk of two disagreeing switches.
         let p = parse_tsql("SELECT status FROM orders;\n").unwrap();
         assert!(!p.calls.is_empty(), "walk layer always extracts; store.rs gates it");
+    }
+
+    // ---- L3.4: CTE lineage (tsql pilot) ----
+
+    #[test]
+    fn tsql_cte_projections_track_bare_passthrough_columns() {
+        let p = parse_tsql(
+            "WITH recent(order_id, cid) AS (\n  SELECT OrderID, CustomerID AS cid FROM Orders WHERE Total > 100\n)\nSELECT r.order_id, r.cid FROM recent r WHERE r.order_id > 0;\n",
+        )
+        .unwrap();
+        let proj = p.cte_columns.get("recent").expect("recent CTE tracked");
+        assert_eq!(proj.get("order_id"), Some(&("orders".to_string(), "orderid".to_string())));
+        assert_eq!(proj.get("cid"), Some(&("orders".to_string(), "customerid".to_string())));
+    }
+
+    #[test]
+    fn tsql_cte_projections_use_derived_name_without_explicit_column_list() {
+        let p = parse_tsql("WITH old AS (SELECT OrderID FROM Orders)\nSELECT * FROM old;\n").unwrap();
+        let proj = p.cte_columns.get("old").expect("old CTE tracked");
+        assert_eq!(proj.get("orderid"), Some(&("orders".to_string(), "orderid".to_string())));
+    }
+
+    #[test]
+    fn tsql_cte_projections_skip_computed_columns_never_guess() {
+        // Mirrors the real dnn-clean-schema-dump/GetTabsByPackageID.sql shape: a window function
+        // alongside bare passthroughs — only the passthroughs get an entry.
+        let p = parse_tsql(
+            "WITH Temp AS (\n  SELECT ROW_NUMBER() OVER (PARTITION BY TabId ORDER BY Version DESC) AS RowNumber, TabVersionId, TabId\n  FROM dbo.TabVersions WHERE IsPublished = 1\n)\nSELECT TabId FROM Temp;\n",
+        )
+        .unwrap();
+        let proj = p.cte_columns.get("temp").expect("temp CTE tracked");
+        assert!(!proj.contains_key("rownumber"), "window function output must never be guessed");
+        assert_eq!(proj.get("tabversionid"), Some(&("tabversions".to_string(), "tabversionid".to_string())));
+        assert_eq!(proj.get("tabid"), Some(&("tabversions".to_string(), "tabid".to_string())));
+    }
+
+    #[test]
+    fn tsql_cte_projections_skip_ambiguous_join_body() {
+        // The CTE body itself joins two tables with no qualifier on the output column — which
+        // underlying table it came from is genuinely ambiguous, so no entry at all (never guess).
+        let p = parse_tsql(
+            "WITH j AS (SELECT id FROM orders o JOIN order_items i ON i.order_id = o.id)\nSELECT id FROM j;\n",
+        )
+        .unwrap();
+        assert!(p.cte_columns.get("j").is_none_or(|m| !m.contains_key("id")));
     }
 
     // ---- PL/SQL ----

@@ -136,6 +136,7 @@ fn parse_one_file(
     rel: String,
     sql: Option<crate::parser::SqlDialect>,
     sql_columns: bool,
+    sql_cte: bool,
 ) -> FileParse {
     let lang = crate::parser::lang_for_path(path, sql).expect("walker only yields registered extensions");
     let outcome = match std::fs::read(path) {
@@ -157,6 +158,9 @@ fn parse_one_file(
                     if !sql_columns {
                         parsed.defs.retain(|d| d.kind != "table" && d.kind != "column");
                     }
+                    if sql_cte {
+                        apply_cte_columns(&mut parsed);
+                    }
                     // T15: tree-sitter is error-tolerant (rarely returns Err above) — a non-empty
                     // file that parses to zero defs+calls+imports is the actually-triggerable
                     // signal that something's wrong (garbage/binary content, or a source shape the
@@ -173,6 +177,30 @@ fn parse_one_file(
         }
     };
     FileParse { rel, lang: lang.name, outcome }
+}
+
+/// L3.4 (CTE lineage) — gated behind `--with-sql-cte` (see `Store::sql_cte`). For every call whose
+/// `receiver_class` is a single (non-`\x1f`-delimited) name tracked in `parsed.cte_columns`,
+/// rewrite it to the REAL table/column the CTE actually re-projects, so it resolves against real
+/// schema exactly like a direct reference would — instead of an always-empty CTE-name
+/// `parent_class`. One layer above the walk (same "storage-policy gate, not a parsing capability
+/// gate" as `sql_columns`'s defs filter above): the walk always exports `cte_columns`
+/// unconditionally, this is the only place it's ever applied.
+pub(crate) fn apply_cte_columns(parsed: &mut crate::parser::ParsedFile) {
+    if parsed.cte_columns.is_empty() {
+        return;
+    }
+    let cte_columns = parsed.cte_columns.clone();
+    for c in parsed.calls.iter_mut() {
+        let Some(rc) = &c.receiver_class else { continue };
+        if rc.contains('\u{1f}') {
+            continue; // multi-table ambiguous scope — v1 doesn't expand a CTE inside a candidate set
+        }
+        if let Some((real_table, real_col)) = cte_columns.get(rc).and_then(|m| m.get(&c.name)) {
+            c.name = real_col.clone();
+            c.receiver_class = Some(real_table.clone());
+        }
+    }
 }
 
 // ---- read-side query results (S1.4) ----------------------------------------
@@ -455,6 +483,12 @@ pub struct Store {
     /// are filtered out before storage, restoring the pre-Wave-L3 "DDL-only file has zero defs"
     /// behavior exactly.
     sql_columns: bool,
+    /// L3.4 (CTE lineage) — meta key `sql_cte`, set by `index --with-sql-cte`. Off by default:
+    /// pilot-scoped (T-SQL only so far), shipped dark until proven out. False -> the walk still
+    /// exports `ParsedFile::cte_columns` (unconditional, see its doc comment) but `parse_one_file`
+    /// never applies it, so a CTE-scoped read resolves exactly as it did before this feature
+    /// existed (unresolved, its receiver_class is a name no `symbols` row ever has).
+    sql_cte: bool,
 }
 
 impl Store {
@@ -510,7 +544,12 @@ impl Store {
             .optional()?
             .map(|v| v == "1")
             .unwrap_or(false);
-        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect, sql_columns })
+        let sql_cte = conn
+            .query_row("SELECT value FROM meta WHERE key='sql_cte'", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect, sql_columns, sql_cte })
     }
 
     /// L2.1 — persist the repo's `.sql` dialect so refresh/queries (and seeded copies) inherit it.
@@ -536,6 +575,19 @@ impl Store {
         Ok(())
     }
 
+    /// L3.4 (CTE lineage) — persist whether CTE-scoped reads are rewritten to their real
+    /// underlying table/column, so refresh inherits it the same way `set_sql_columns` does. Off by
+    /// default (see the `sql_cte` field doc).
+    pub fn set_sql_cte(&mut self, on: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('sql_cte',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if on { "1" } else { "0" }],
+        )?;
+        self.sql_cte = on;
+        Ok(())
+    }
+
     /// Cold full index: parse all registered-language files, persist symbols/imports, then resolve edges.
     ///
     /// F1 — CRITICAL: clearing the old graph and writing the new one happen inside ONE transaction,
@@ -550,6 +602,7 @@ impl Store {
     pub fn index_repo(&mut self, root: &Path) -> Result<IndexStats> {
         let sql = self.sql_dialect;
         let sql_columns = self.sql_columns;
+        let sql_cte = self.sql_cte;
         let files = source_files(root, sql);
         let mut st = IndexStats::default();
 
@@ -560,7 +613,7 @@ impl Store {
             .par_iter()
             .map(|path| {
                 let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-                parse_one_file(path, rel, sql, sql_columns)
+                parse_one_file(path, rel, sql, sql_columns, sql_cte)
             })
             .collect();
 
@@ -3836,6 +3889,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(id_edges, 2, "o.Id -> Orders.Id and s.Id -> Shipments.Id, both exact");
+    }
+
+    /// L3.4 (CTE lineage pilot) — a T-SQL proc reading a column through a CTE alias resolves
+    /// `unresolved` by default (the CTE name never matches a real `parent_class`, exactly the
+    /// pre-feature behavior) and `exact` against the CTE's real underlying table once
+    /// `--with-sql-cte` is on — the actual payoff: `impact --diff` on `Orders.Status` now also
+    /// finds readers that only ever go through a CTE.
+    #[test]
+    fn l3_4_sql_cte_is_opt_in_and_resolves_through_the_real_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE Orders (Status VARCHAR(20), Id INT);\n").unwrap();
+        fs::write(
+            root.join("procs.sql"),
+            "CREATE PROCEDURE RecentStatus\nAS\nBEGIN\n  WITH Recent AS (SELECT Status, Id FROM Orders)\n  SELECT r.Status FROM Recent r WHERE r.Id = 5;\nEND\nGO\n",
+        )
+        .unwrap();
+
+        let mut off = Store::open(root).unwrap();
+        off.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        off.set_sql_columns(true).unwrap();
+        off.index_repo(root).unwrap();
+        assert_eq!(resolved(&off, "status", "recentstatus").0, "unresolved", "sql_cte off by default");
+
+        let mut on = Store::open(root).unwrap();
+        on.set_sql_dialect(crate::parser::SqlDialect::Tsql).unwrap();
+        on.set_sql_columns(true).unwrap();
+        on.set_sql_cte(true).unwrap();
+        on.index_repo(root).unwrap();
+        assert_eq!(
+            resolved(&on, "status", "recentstatus"),
+            ("exact".into(), Some("schema.sql".into())),
+            "r.Status -> Recent's real underlying Orders.Status"
+        );
+        assert_eq!(edge_kinds(&on, "status", "recentstatus").1, "read");
+
+        // Persistence: same contract as sql_columns.
+        let reopened = Store::open(root).unwrap();
+        let v: i64 = reopened
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='sql_cte'", [], |r| r.get::<_, String>(0))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(v, 1, "sql_cte=on persisted across Store::open");
     }
 
     /// L3.3 — the actual origin question this wave exists to answer: `impact --diff` on a changed
