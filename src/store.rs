@@ -131,7 +131,12 @@ struct FileParse {
 /// T13 — read + parse `path` (relative name `rel`); pure CPU work, safe to run on a rayon thread.
 /// L1.1: the walk is dispatched by extension via the registry — `path` is only ever a file the
 /// registered-extension walker yielded. L2.1: `.sql` dispatch needs the store's dialect.
-fn parse_one_file(path: &Path, rel: String, sql: Option<crate::parser::SqlDialect>) -> FileParse {
+fn parse_one_file(
+    path: &Path,
+    rel: String,
+    sql: Option<crate::parser::SqlDialect>,
+    sql_columns: bool,
+) -> FileParse {
     let lang = crate::parser::lang_for_path(path, sql).expect("walker only yields registered extensions");
     let outcome = match std::fs::read(path) {
         Err(e) => ParseOutcome::Unreadable(format!("unreadable: {e}")),
@@ -144,7 +149,14 @@ fn parse_one_file(path: &Path, rel: String, sql: Option<crate::parser::SqlDialec
             let hash = hash_bytes(&bytes);
             match (lang.parse)(&src) {
                 Err(e) => ParseOutcome::ParseErr { hash, err: e.to_string() },
-                Ok(parsed) => {
+                Ok(mut parsed) => {
+                    // L3 — table/column defs are opt-in (see `Store::sql_columns` doc). Filtered
+                    // here, one layer above the walk, so the walk functions themselves (and their
+                    // existing unit tests) stay unconditional — this is a storage-policy gate, not
+                    // a parsing capability gate.
+                    if !sql_columns {
+                        parsed.defs.retain(|d| d.kind != "table" && d.kind != "column");
+                    }
                     // T15: tree-sitter is error-tolerant (rarely returns Err above) — a non-empty
                     // file that parses to zero defs+calls+imports is the actually-triggerable
                     // signal that something's wrong (garbage/binary content, or a source shape the
@@ -436,6 +448,13 @@ pub struct Store {
     /// `index --sql-dialect`). None -> `.sql` files are not indexed; Oracle-only extensions
     /// (.pks/.pkb/...) are always PL/SQL regardless.
     sql_dialect: Option<crate::parser::SqlDialect>,
+    /// L3 (Wave L3, Phase A) — table/column def extraction from CREATE TABLE, meta key
+    /// `sql_columns`, set by `index --sql-columns`. Off by default: this is new, unvalidated
+    /// behavior — shipping it dark until proven out on real corpora, not on by default the moment
+    /// the walk code lands. False -> CREATE TABLE parses (dialect permitting) but table/column defs
+    /// are filtered out before storage, restoring the pre-Wave-L3 "DDL-only file has zero defs"
+    /// behavior exactly.
+    sql_columns: bool,
 }
 
 impl Store {
@@ -486,7 +505,12 @@ impl Store {
             .query_row("SELECT value FROM meta WHERE key='sql_dialect'", [], |r| r.get::<_, String>(0))
             .optional()?
             .and_then(|v| crate::parser::SqlDialect::parse(&v).ok());
-        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect })
+        let sql_columns = conn
+            .query_row("SELECT value FROM meta WHERE key='sql_columns'", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        Ok(Self { conn, root: repo_root.to_path_buf(), sql_dialect, sql_columns })
     }
 
     /// L2.1 — persist the repo's `.sql` dialect so refresh/queries (and seeded copies) inherit it.
@@ -497,6 +521,18 @@ impl Store {
             [d.as_str()],
         )?;
         self.sql_dialect = Some(d);
+        Ok(())
+    }
+
+    /// L3 — persist whether table/column defs from CREATE TABLE are kept, so refresh inherits it
+    /// the same way `set_sql_dialect` does. Off by default (see the `sql_columns` field doc).
+    pub fn set_sql_columns(&mut self, on: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('sql_columns',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if on { "1" } else { "0" }],
+        )?;
+        self.sql_columns = on;
         Ok(())
     }
 
@@ -513,6 +549,7 @@ impl Store {
     /// which could wipe the graph and then be interrupted before the rebuild finished.
     pub fn index_repo(&mut self, root: &Path) -> Result<IndexStats> {
         let sql = self.sql_dialect;
+        let sql_columns = self.sql_columns;
         let files = source_files(root, sql);
         let mut st = IndexStats::default();
 
@@ -523,7 +560,7 @@ impl Store {
             .par_iter()
             .map(|path| {
                 let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-                parse_one_file(path, rel, sql)
+                parse_one_file(path, rel, sql, sql_columns)
             })
             .collect();
 
@@ -3611,9 +3648,10 @@ mod tests {
     }
 
     /// L2.5 PostgreSQL — `--sql-dialect=postgres`: a plpgsql body's PERFORM resolves exact
-    /// cross-file; schema-qualified call in a body lands kind `method`; DDL-only file is not
-    /// suspect (L3.2: it DOES now contribute defs — a `table` + its `column`s — this test's
-    /// job is confirming that's the ONLY thing schema.sql contributes, not that it's zero).
+    /// cross-file; schema-qualified call in a body lands kind `method`; DDL-only file is neither
+    /// suspect nor a def source. L3.2 added table/column extraction from CREATE TABLE, but it's
+    /// opt-in (`--sql-columns`, off by default — see `l3_sql_columns_is_opt_in`) — this test
+    /// doesn't set it, so schema.sql's behavior here is unchanged from before Wave L3.
     #[test]
     fn l2_postgres_fixture_pair() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3642,8 +3680,41 @@ mod tests {
         assert!(s.parse_failures().unwrap().is_empty(), "DDL-only schema.sql is not suspect");
         let ddl_syms: i64 =
             s.conn.query_row("SELECT COUNT(*) FROM symbols WHERE file='schema.sql'", [], |r| r.get(0)).unwrap();
-        assert_eq!(ddl_syms, 2, "L3.2: table `orders` + column `id`, nothing else");
-        assert_eq!(parent_of(&s, "id").as_deref(), Some("orders"), "column's parent is its table");
+        assert_eq!(ddl_syms, 0, "sql_columns off by default — DDL-only file contributes no defs");
+    }
+
+    /// L3 — table/column extraction from CREATE TABLE is opt-in, off by default: the same repo
+    /// indexed once without `--sql-columns` and once with it must show the flag, and only the
+    /// flag, controlling whether schema.sql contributes any defs.
+    #[test]
+    fn l3_sql_columns_is_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE orders (id int primary key);\n").unwrap();
+
+        let mut off = Store::open(root).unwrap();
+        off.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        off.index_repo(root).unwrap();
+        let off_syms: i64 =
+            off.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap();
+        assert_eq!(off_syms, 0, "default: no table/column defs");
+
+        let mut on = Store::open(root).unwrap();
+        on.set_sql_dialect(crate::parser::SqlDialect::Postgres).unwrap();
+        on.set_sql_columns(true).unwrap();
+        on.index_repo(root).unwrap();
+        let on_syms: i64 =
+            on.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap();
+        assert_eq!(on_syms, 2, "opted in: table `orders` + column `id`");
+        assert_eq!(parent_of(&on, "id").as_deref(), Some("orders"));
+
+        // Persistence: re-opening the store (simulating a later `refresh`/query) without passing
+        // --sql-columns again must still remember the repo opted in — same contract as
+        // --sql-dialect.
+        let reopened = Store::open(root).unwrap();
+        let reopened_syms: i64 =
+            reopened.conn.query_row("SELECT value FROM meta WHERE key='sql_columns'", [], |r| r.get::<_, String>(0)).unwrap().parse::<i64>().unwrap();
+        assert_eq!(reopened_syms, 1, "sql_columns=on persisted across Store::open");
     }
 
     /// L2.5 Oracle — `.pks`/`.pkb` need NO dialect flag: the spec's decl emits no def, the body's
