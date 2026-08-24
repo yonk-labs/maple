@@ -843,6 +843,107 @@ fn dotted_parts(s: &str) -> Vec<&str> {
     s.split('.').map(str::trim).filter(|p| !p.is_empty()).collect()
 }
 
+/// L3.3 — postgres's own nested-statement boundary list. A different vocabulary from tsql's
+/// `DML_STOP`: an inline subquery is wrapped as `select_with_parens` (NOT the bare `SelectStmt`
+/// its own top-level statement uses), so tsql's list wouldn't stop at it here.
+const PG_DML_STOP: &[&str] = &["select_with_parens", "SelectStmt", "UpdateStmt", "InsertStmt", "DeleteStmt"];
+
+/// L3.3 — alias/name -> real (bare) table name for every `relation_expr` under a postgres
+/// FROM/JOIN subtree, or UPDATE/DELETE's direct target. `relation_expr` (not `table_ref`) is the
+/// collection target deliberately: a `table_ref` for a JOIN wraps `joined_table`, which itself
+/// contains TWO MORE `table_ref`s (one per side) — `table_ref` self-nests and a naive "stop at
+/// first match" collector would find only the outer wrapper and miss both real tables (caught live
+/// by `pg_join_widens_unqualified_scope`, which returned only one of the two joined tables before
+/// this fix). `relation_expr` never self-nests, so it's the genuinely leaf-like target; its alias
+/// (if any) is found by walking up ONE level to its own immediate parent (`table_ref` for a
+/// FROM/JOIN entry, `relation_expr_opt_alias` for a bare UPDATE/DELETE target) rather than
+/// searching the whole subtree — both shapes are handled uniformly this way, no separate
+/// bare-target fallback branch needed.
+fn pg_table_scope(node: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut scope = HashMap::new();
+    for re in find_descendants_scoped(node, "relation_expr", PG_DML_STOP) {
+        let Some(qn) = find_child(re, "qualified_name") else { continue };
+        let Some(nm) = qualified_name_object(qn, src) else { continue };
+        let table = norm(nm);
+        scope.insert(table.clone(), table.clone());
+        if let Some(parent) = re.parent() {
+            if let Some(alias_clause) = find_child(parent, "alias_clause")
+                .or_else(|| find_child(parent, "opt_alias_clause").and_then(|oac| find_child(oac, "alias_clause")))
+            {
+                if let Some(acid) = find_child(alias_clause, "ColId") {
+                    scope.insert(norm(text(acid, src)), table);
+                }
+            }
+        }
+    }
+    scope
+}
+
+/// L3.3 — a postgres `columnref` node's own column name plus its optional qualifier. `columnref`'s
+/// first child (`ColId`) is the BARE column name when unqualified, or the QUALIFIER when an
+/// `indirection` follows (the actual column name then lives in `indirection`'s `attr_name`). Takes
+/// each matched node's own full text span rather than reaching for a specific leaf kind inside it
+/// (`identifier` vs `unreserved_keyword` — a column literally named `name` tags differently than
+/// one named `status`, and the span text is correct either way).
+fn pg_columnref_parts<'a>(columnref: Node, src: &'a [u8]) -> (Option<&'a str>, Option<&'a str>) {
+    let Some(colid) = find_child(columnref, "ColId") else {
+        return (None, None);
+    };
+    match find_descendant(columnref, "attr_name") {
+        Some(attr) => (Some(text(colid, src)), Some(text(attr, src))),
+        None => (None, Some(text(colid, src))),
+    }
+}
+
+/// L3 — the real object name from a postgres `qualified_name` node. `ColId` alone is only correct
+/// when the name is unqualified: a schema-qualified name (`Sales.BuyingGroups`) uses the SAME
+/// `ColId` + optional `indirection` shape `columnref` does — `ColId` holds the FIRST part (the
+/// schema), and the real object name is in `indirection`'s (last, for a 3+-part name)
+/// `indirection_el -> attr_name`. Found live: Phase A's own CREATE TABLE handling had exactly this
+/// bug for schema-qualified tables — extracting "sales" as the table name from `CREATE TABLE
+/// Sales.BuyingGroups`, surfaced dogfooding the real Wide World Importers schema (every table
+/// there is schema-qualified), not by any fixture — none of this session's own hand-written test
+/// SQL happened to use a schema prefix, which is exactly why a real corpus matters.
+fn qualified_name_object<'a>(qn: Node, src: &'a [u8]) -> Option<&'a str> {
+    if let Some(indirection) = find_child(qn, "indirection") {
+        let mut c = indirection.walk();
+        let last = indirection
+            .named_children(&mut c)
+            .filter(|el| el.kind() == "indirection_el")
+            .filter_map(|el| find_child(el, "attr_name"))
+            .last();
+        if let Some(attr) = last {
+            return Some(text(attr, src));
+        }
+    }
+    find_child(qn, "ColId").map(|c| text(c, src))
+}
+
+/// L3.3 — every column reference (`columnref` node) under `node`, resolved against `scope`,
+/// emitted as `access`. Stops at nested-statement boundaries (`PG_DML_STOP`) so a subquery's
+/// fields aren't misattributed to this scope.
+fn push_pg_columnref_refs(
+    out: &mut ParsedFile,
+    node: Node,
+    src: &[u8],
+    scope: &HashMap<String, String>,
+    access: &str,
+    enclosing: &str,
+) {
+    for cr in find_descendants_scoped(node, "columnref", PG_DML_STOP) {
+        let (qualifier, column) = pg_columnref_parts(cr, src);
+        let Some(col) = column else { continue };
+        push_column_ref(
+            out,
+            col,
+            access,
+            scope_receiver(scope, qualifier),
+            cr.start_position().row + 1,
+            enclosing,
+        );
+    }
+}
+
 fn walk_pg(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &mut PgParsers, in_error: bool) {
     let in_error = entering_error(node, in_error);
     let mut def_name: Option<String> = None;
@@ -877,17 +978,15 @@ fn walk_pg(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &m
         // tsql/plsql's field-named lists.
         "CreateStmt" if find_child(node, "kw_table").is_some() => {
             if let Some(qn) = find_child(node, "qualified_name") {
-                if let Some(nm) = find_child(qn, "ColId").and_then(|c| find_child(c, "identifier")) {
-                    let d = mk_def(text(nm, src), "table", None, node, src);
+                if let Some(nm) = qualified_name_object(qn, src) {
+                    let d = mk_def(nm, "table", None, node, src);
                     let table_name = d.name.clone();
                     def_name = Some(table_name.clone());
                     out.defs.push(d);
                     for col in find_descendants(node, "columnDef") {
-                        if let Some(cn) =
-                            find_child(col, "ColId").and_then(|c| find_child(c, "identifier"))
-                        {
+                        if let Some(cid) = find_child(col, "ColId") {
                             out.defs.push(mk_def(
-                                text(cn, src),
+                                text(cid, src),
                                 "column",
                                 Some(&table_name),
                                 col,
@@ -902,6 +1001,88 @@ fn walk_pg(node: Node, src: &[u8], out: &mut ParsedFile, enclosing: &str, ps: &m
         "func_application" if !in_error => {
             if let Some(fname) = find_child(node, "func_name") {
                 pg_push_func(out, text(fname, src), node.start_position().row + 1, enclosing);
+            }
+        }
+        // L3.3: SELECT list + JOIN-ON + WHERE column references, all reads. Matched on
+        // `simple_select`, NOT `SelectStmt` — a top-level query is `SelectStmt -> select_no_parens
+        // -> simple_select`, but an inline subquery is `select_with_parens -> select_no_parens ->
+        // simple_select`, with NO `SelectStmt` node at that level at all. `simple_select` is the
+        // one node kind present in both shapes, so matching on it (rather than trying to also
+        // match `select_with_parens` separately) gives both the outer query and every nested
+        // subquery their own correctly-scoped extraction uniformly. `push_pg_columnref_refs` stops
+        // at `PG_DML_STOP` (which includes `select_with_parens`), so a subquery's own fields are
+        // never double-counted into the outer scope.
+        //
+        // `from_clause` lookup deliberately uses `find_descendants_scoped` (stack-safe, respects
+        // PG_DML_STOP), NOT the older `find_descendant` — that helper's stack-based DFS visits
+        // children in REVERSE order (LIFO pop), so `find_descendant(select_stmt, "from_clause")`
+        // could return a SUBQUERY's own nested from_clause instead of the outer statement's real
+        // one, when the WHERE clause (containing the subquery) is examined before the FROM clause
+        // is. Caught live by `pg_subquery_gets_its_own_scope_not_the_outer_ones`.
+        "simple_select" if !in_error => {
+            let scope = find_descendants_scoped(node, "from_clause", PG_DML_STOP)
+                .into_iter()
+                .next()
+                .map(|f| pg_table_scope(f, src))
+                .unwrap_or_default();
+            push_pg_columnref_refs(out, node, src, &scope, "read", enclosing);
+        }
+        // UPDATE: SET target = write; SET source expression + WHERE = reads.
+        "UpdateStmt" if !in_error => {
+            let scope = pg_table_scope(node, src);
+            for set_clause in find_descendants_scoped(node, "set_clause", PG_DML_STOP) {
+                if let Some(target) = find_child(set_clause, "set_target") {
+                    if let Some(cid) = find_child(target, "ColId") {
+                        push_column_ref(
+                            out,
+                            text(cid, src),
+                            "write",
+                            scope_receiver(&scope, None),
+                            cid.start_position().row + 1,
+                            enclosing,
+                        );
+                    }
+                }
+                // the value expression is every other named child of set_clause besides set_target
+                for child in set_clause.named_children(&mut set_clause.walk()) {
+                    if child.kind() != "set_target" {
+                        push_pg_columnref_refs(out, child, src, &scope, "read", enclosing);
+                    }
+                }
+            }
+            if let Some(w) = find_child(node, "where_or_current_clause") {
+                push_pg_columnref_refs(out, w, src, &scope, "read", enclosing);
+            }
+        }
+        // INSERT: the column list is a write to the single target table.
+        "InsertStmt" if !in_error => {
+            if let Some(it) = find_child(node, "insert_target") {
+                if let Some(qn) = find_child(it, "qualified_name") {
+                    if let Some(nm) = qualified_name_object(qn, src) {
+                        let table = norm(nm);
+                        let mut scope = HashMap::new();
+                        scope.insert(table.clone(), table);
+                        for item in find_descendants_scoped(node, "insert_column_item", PG_DML_STOP) {
+                            if let Some(icid) = find_child(item, "ColId") {
+                                push_column_ref(
+                                    out,
+                                    text(icid, src),
+                                    "write",
+                                    scope_receiver(&scope, None),
+                                    icid.start_position().row + 1,
+                                    enclosing,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // DELETE: target table + WHERE, both direct children (unlike tsql, no sibling split).
+        "DeleteStmt" if !in_error => {
+            let scope = pg_table_scope(node, src);
+            if let Some(w) = find_child(node, "where_or_current_clause") {
+                push_pg_columnref_refs(out, w, src, &scope, "read", enclosing);
             }
         }
         _ => {}
@@ -1499,6 +1680,98 @@ $$ LANGUAGE 'plpgsql';
     }
 
     #[test]
+    fn pg_schema_qualified_table_extracts_the_table_not_the_schema() {
+        // Regression: `qualified_name`'s object name lives in `indirection`'s `attr_name` when
+        // schema-qualified, NOT in the bare `ColId` (which holds the schema part instead) — found
+        // dogfooding the real Wide World Importers schema, where every table is schema-qualified
+        // and every one of them was extracting as the wrong (schema) name before this fix.
+        let p = parse_postgres("CREATE TABLE Sales.BuyingGroups (BuyingGroupID int, Name varchar(50));\n").unwrap();
+        let table = p.defs.iter().find(|d| d.kind == "table").expect("table def");
+        assert_eq!(table.name, "buyinggroups", "not 'sales' (the schema)");
+        let id = p.defs.iter().find(|d| d.name == "buyinggroupid").expect("id column");
+        assert_eq!(id.parent_class.as_deref(), Some("buyinggroups"));
+        // Regression: a column whose name is also a SQL keyword-ish word (`Name`) tags its ColId's
+        // inner leaf as `unreserved_keyword` instead of `identifier` — reaching for `identifier`
+        // specifically (as this code used to) silently drops the column. Taking ColId's own span
+        // works for both leaf shapes.
+        assert!(p.defs.iter().any(|d| d.name == "name" && d.kind == "column"), "{:?}", p.defs);
+    }
+
+    #[test]
+    fn pg_schema_qualified_insert_target_resolves_the_table() {
+        let p = parse_postgres("INSERT INTO Sales.BuyingGroups (BuyingGroupID) VALUES (1);\n").unwrap();
+        assert_eq!(
+            find_col(&p, "buyinggroupid", "write").receiver_class.as_deref(),
+            Some("buyinggroups")
+        );
+    }
+
+    // ---- L3.3: postgres DML column references ----
+
+    #[test]
+    fn pg_select_qualified_and_unqualified_reads() {
+        let p = parse_postgres(
+            "SELECT o.status, total FROM orders o WHERE o.id = 5 AND total > 0;\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert!(p
+            .calls
+            .iter()
+            .filter(|c| c.name == "total" && c.kind == "read")
+            .all(|c| c.receiver_class.as_deref() == Some("orders")));
+    }
+
+    #[test]
+    fn pg_join_widens_unqualified_scope() {
+        let p = parse_postgres(
+            "SELECT status FROM orders o JOIN order_items oi ON o.id = oi.order_id WHERE status = 'open';\n",
+        )
+        .unwrap();
+        let scope = find_col(&p, "status", "read").receiver_class.clone().unwrap();
+        let mut names: Vec<&str> = scope.split('\u{1f}').collect();
+        names.sort();
+        assert_eq!(names, vec!["order_items", "orders"]);
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "order_id", "read").receiver_class.as_deref(), Some("order_items"));
+    }
+
+    #[test]
+    fn pg_update_set_target_is_write_where_is_read() {
+        let p = parse_postgres("UPDATE orders SET status = 'closed', total = price WHERE id = 5;\n").unwrap();
+        assert_eq!(find_col(&p, "status", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "total", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "price", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn pg_insert_column_list_is_write() {
+        let p = parse_postgres("INSERT INTO orders (id, status) VALUES (1, 'open');\n").unwrap();
+        assert_eq!(find_col(&p, "id", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "status", "write").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn pg_delete_where_is_read() {
+        let p = parse_postgres("DELETE FROM orders WHERE status = 'closed';\n").unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn pg_subquery_gets_its_own_scope_not_the_outer_ones() {
+        let p = parse_postgres(
+            "SELECT status FROM orders WHERE id IN (SELECT order_id FROM order_items WHERE total > 100);\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "order_id", "read").receiver_class.as_deref(), Some("order_items"));
+        assert_eq!(find_col(&p, "total", "read").receiver_class.as_deref(), Some("order_items"));
+    }
+
+    #[test]
     fn blank_dollar_delims_preserves_rows() {
         let body = "$fn$\nBEGIN\nEND;\n$fn$";
         let blanked = blank_dollar_delims(body).unwrap();
@@ -1508,4 +1781,5 @@ $$ LANGUAGE 'plpgsql';
         assert!(blank_dollar_delims("'not dollar'").is_none());
     }
 }
+
 
