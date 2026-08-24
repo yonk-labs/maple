@@ -1,7 +1,7 @@
 {
   "name": "maple",
   "displayName": "Maple",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "An always-fresh code-symbol graph for LLM coding agents: exact caller/callee closures and token-budgeted context bundles, no daemon or stale cache. Exposes enumerate/closure/bundle as MCP tools.",
   "author": {
     "name": "yonk-labs",

@@ -1,6 +1,6 @@
 [package]
 name = "maple"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 description = "code-symbol-graph: always-fresh code symbol map for byte-sized subagent context bundles"
 license = "Apache-2.0"
