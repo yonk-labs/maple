@@ -650,6 +650,117 @@ fn strip_sqlplus_lines(src: &str) -> String {
         .join("\n")
 }
 
+/// L3.3 — plsql's own nested-statement boundary list. `scalar_subquery` is a DIFFERENT node kind
+/// from `sql_statement_select` for an inline nested query (unlike postgres, where the same
+/// `simple_select` node appears at both nesting levels) — every statement kind is included for
+/// consistency/safety even though only SELECT genuinely nests in practice.
+const PLSQL_DML_STOP: &[&str] = &[
+    "scalar_subquery",
+    "sql_statement_select",
+    "sql_statement_update",
+    "sql_statement_insert",
+    "sql_statement_delete",
+];
+
+/// L3.3 — one `referenced_element` node's `ref_name` plus optional `ref_name_parent` qualifier.
+/// The SAME node kind is used for both table names (in `table_list`) and column references (in
+/// `select_list`/`where_clause`/etc) — callers scope their search to the right subtree so the two
+/// never get conflated (see `plsql_table_scope` vs `push_plsql_referenced_element_refs`).
+fn plsql_referenced_element_parts<'a>(re: Node, src: &'a [u8]) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        re.child_by_field_name("ref_name_parent").map(|n| text(n, src)),
+        re.child_by_field_name("ref_name").map(|n| text(n, src)),
+    )
+}
+
+/// L3.3 — alias/name -> real (bare) table name for every `referenced_element` under a plsql
+/// `table_list` (searched scoped to that subtree specifically, never the whole statement, so a
+/// column reference elsewhere is never mistaken for a table). Covers both shapes, confirmed via
+/// grammar dump: a plain `table_list_element (referenced_element ...) alias: (identifier)` (no
+/// join — one alias field, safe to read directly off the parent), and a `join_clause`'s TWO
+/// `referenced_element`s + TWO `alias:` fields as FLAT SIBLINGS of each other under the SAME
+/// parent — `child_by_field_name` only ever returns the FIRST match for a repeated field name, so
+/// for the join shape the alias must be found positionally (`next_alias_for`), not via
+/// `parent().child_by_field_name("alias")`, or both aliases resolve to the first table.
+fn plsql_table_scope(table_list: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut scope = HashMap::new();
+    let stop: Vec<&str> = PLSQL_DML_STOP.iter().copied().chain(std::iter::once("expression")).collect();
+    for re in find_descendants_scoped(table_list, "referenced_element", &stop) {
+        let Some(nm) = re.child_by_field_name("ref_name") else { continue };
+        let table = norm(text(nm, src));
+        scope.insert(table.clone(), table.clone());
+        if let Some(alias) = next_alias_for(re) {
+            scope.insert(norm(text(alias, src)), table);
+        }
+    }
+    scope
+}
+
+/// Find the `alias:`-field sibling immediately following `re` under `re`'s parent, stopping (and
+/// returning `None`) if another `referenced_element` is reached first — i.e. an unaliased table.
+/// Needed because a `join_clause` has two `referenced_element`s sharing one parent with two
+/// same-named `alias` fields, which `Node::child_by_field_name` cannot disambiguate by itself.
+fn next_alias_for(re: Node) -> Option<Node> {
+    let parent = re.parent()?;
+    let mut cursor = parent.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    let mut found = false;
+    loop {
+        if found {
+            if cursor.field_name() == Some("alias") {
+                return Some(cursor.node());
+            }
+            if cursor.node().kind() == "referenced_element" {
+                return None;
+            }
+        } else if cursor.node().id() == re.id() {
+            found = true;
+        }
+        if !cursor.goto_next_sibling() {
+            return None;
+        }
+    }
+}
+
+/// L3.3 — every column reference (`referenced_element` node) under `node`, resolved against
+/// `scope`, emitted as `access`. Stops at nested-statement boundaries (`PLSQL_DML_STOP`) so a
+/// subquery's fields aren't misattributed to this scope. Caller must scope `node` to an
+/// expression context (select_list, where_clause, ...) — never `table_list`, whose
+/// `referenced_element`s are table names, not columns.
+fn push_plsql_referenced_element_refs(
+    out: &mut ParsedFile,
+    node: Node,
+    src: &[u8],
+    scope: &HashMap<String, String>,
+    access: &str,
+    enclosing: &str,
+) {
+    for re in find_descendants_scoped(node, "referenced_element", PLSQL_DML_STOP) {
+        // A function call's callee name is ALSO a bare `referenced_element` — `ROUND(total, 2)`
+        // parses as `(ref_call (referenced_element ref_name: "ROUND") (parameter ...))` — so the
+        // callee-name node is the direct child of `ref_call`, unlike its arguments (nested several
+        // levels down through parameter/expression). Skip it here; `walk_plsql`'s own `"ref_call"`
+        // arm already extracts it as a real call, and re-emitting it as a column read would
+        // misclassify every builtin/user function name (ROUND, NULLIF, MONTHS_BETWEEN, ...) used
+        // in a SQL expression as a nonexistent column.
+        if re.parent().map(|p| p.kind()) == Some("ref_call") {
+            continue;
+        }
+        let (qualifier, column) = plsql_referenced_element_parts(re, src);
+        let Some(col) = column else { continue };
+        push_column_ref(
+            out,
+            col,
+            access,
+            scope_receiver(scope, qualifier),
+            re.start_position().row + 1,
+            enclosing,
+        );
+    }
+}
+
 pub fn parse_plsql(src: &str) -> anyhow::Result<ParsedFile> {
     let pre = strip_sqlplus_lines(src);
     let tree = tree_for(&pre, tree_sitter_plsql::language(), "plsql")?;
@@ -781,6 +892,101 @@ fn walk_plsql(
                         });
                     }
                 }
+            }
+        }
+        // L3.3: SELECT list + JOIN-ON + WHERE column references, all reads. Matched on both
+        // `sql_statement_select` (top-level) and `scalar_subquery` (a nested query — a DIFFERENT
+        // node kind here, unlike postgres where the same inner node appears at both levels) so
+        // each gets its own correctly-scoped extraction; `PLSQL_DML_STOP` (which includes
+        // `scalar_subquery`) keeps a subquery's own fields from leaking into the outer scope.
+        "sql_statement_select" | "scalar_subquery" if !in_error => {
+            let scope = find_child(node, "table_list")
+                .map(|tl| plsql_table_scope(tl, src))
+                .unwrap_or_default();
+            if let Some(sl) = find_child(node, "select_list") {
+                push_plsql_referenced_element_refs(out, sl, src, &scope, "read", enclosing);
+            }
+            if let Some(w) = find_child(node, "where_clause") {
+                push_plsql_referenced_element_refs(out, w, src, &scope, "read", enclosing);
+            }
+            // JOIN-ON predicate fields live inside table_list's join_clause -> expression, a
+            // sibling of the table references `plsql_table_scope` deliberately stops before.
+            if let Some(tl) = find_child(node, "table_list") {
+                for jc in find_descendants_scoped(tl, "join_clause", PLSQL_DML_STOP) {
+                    if let Some(on_expr) = find_child(jc, "expression") {
+                        push_plsql_referenced_element_refs(out, on_expr, src, &scope, "read", enclosing);
+                    }
+                }
+            }
+        }
+        // UPDATE: SET target = write; SET source expression + WHERE = reads. Target table is a
+        // direct child (no table_list wrapper the way SELECT has), so its scope is exactly the
+        // one table being updated.
+        "sql_statement_update" if !in_error => {
+            let mut scope = HashMap::new();
+            if let Some(re) = find_child(node, "referenced_element") {
+                if let Some(nm) = re.child_by_field_name("ref_name") {
+                    let table = norm(text(nm, src));
+                    scope.insert(table.clone(), table);
+                }
+            }
+            for elems in find_descendants_scoped(node, "update_set_clause_elements", PLSQL_DML_STOP) {
+                if let Some(target) = find_child(elems, "referenced_element") {
+                    if let Some(nm) = target.child_by_field_name("ref_name") {
+                        push_column_ref(
+                            out,
+                            text(nm, src),
+                            "write",
+                            scope_receiver(&scope, None),
+                            target.start_position().row + 1,
+                            enclosing,
+                        );
+                    }
+                }
+                if let Some(expr) = find_child(elems, "expression") {
+                    push_plsql_referenced_element_refs(out, expr, src, &scope, "read", enclosing);
+                }
+            }
+            if let Some(w) = find_child(node, "where_clause") {
+                push_plsql_referenced_element_refs(out, w, src, &scope, "read", enclosing);
+            }
+        }
+        // INSERT: the column list is a write to the single target table.
+        "sql_statement_insert" if !in_error => {
+            if let Some(re) = find_descendants_scoped(node, "referenced_element", PLSQL_DML_STOP)
+                .into_iter()
+                .next()
+            {
+                if let Some(nm) = re.child_by_field_name("ref_name") {
+                    let table = norm(text(nm, src));
+                    let mut scope = HashMap::new();
+                    scope.insert(table.clone(), table);
+                    for col in find_descendants_scoped(node, "insert_column", PLSQL_DML_STOP) {
+                        if let Some(id) = col.named_child(0) {
+                            push_column_ref(
+                                out,
+                                text(id, src),
+                                "write",
+                                scope_receiver(&scope, None),
+                                id.start_position().row + 1,
+                                enclosing,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // DELETE: target table + WHERE, both direct children.
+        "sql_statement_delete" if !in_error => {
+            let mut scope = HashMap::new();
+            if let Some(re) = find_child(node, "referenced_element") {
+                if let Some(nm) = re.child_by_field_name("ref_name") {
+                    let table = norm(text(nm, src));
+                    scope.insert(table.clone(), table);
+                }
+            }
+            if let Some(w) = find_child(node, "where_clause") {
+                push_plsql_referenced_element_refs(out, w, src, &scope, "read", enclosing);
             }
         }
         _ => {}
@@ -1484,6 +1690,85 @@ GO
         assert_eq!(p.defs.len(), 3, "table + 2 columns, nothing else");
     }
 
+    // ---- L3.3: plsql DML column references ----
+
+    #[test]
+    fn plsql_select_qualified_and_unqualified_reads() {
+        let p = parse_plsql(
+            "BEGIN\n  SELECT o.status, total INTO v_s, v_t FROM orders o WHERE o.id = 5 AND total > 0;\nEND;\n/\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert!(p
+            .calls
+            .iter()
+            .filter(|c| c.name == "total" && c.kind == "read")
+            .all(|c| c.receiver_class.as_deref() == Some("orders")));
+    }
+
+    #[test]
+    fn plsql_join_widens_unqualified_scope() {
+        let p = parse_plsql(
+            "BEGIN\n  SELECT status INTO v_s FROM orders o JOIN order_items oi ON o.id = oi.order_id WHERE status = 'open';\nEND;\n/\n",
+        )
+        .unwrap();
+        let scope = find_col(&p, "status", "read").receiver_class.clone().unwrap();
+        let mut names: Vec<&str> = scope.split('\u{1f}').collect();
+        names.sort();
+        assert_eq!(names, vec!["order_items", "orders"]);
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "order_id", "read").receiver_class.as_deref(), Some("order_items"));
+    }
+
+    #[test]
+    fn plsql_update_set_target_is_write_where_is_read() {
+        let p = parse_plsql(
+            "BEGIN\n  UPDATE orders SET status = 'closed', total = price WHERE id = 5;\nEND;\n/\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "status", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "total", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "price", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn plsql_insert_column_list_is_write() {
+        let p = parse_plsql("BEGIN\n  INSERT INTO orders (id, status) VALUES (1, 'open');\nEND;\n/\n").unwrap();
+        assert_eq!(find_col(&p, "id", "write").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "status", "write").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn plsql_delete_where_is_read() {
+        let p = parse_plsql("BEGIN\n  DELETE FROM orders WHERE status = 'closed';\nEND;\n/\n").unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn plsql_subquery_gets_its_own_scope_not_the_outer_ones() {
+        let p = parse_plsql(
+            "BEGIN\n  SELECT status INTO v_s FROM orders WHERE id IN (SELECT order_id FROM order_items WHERE total > 100);\nEND;\n/\n",
+        )
+        .unwrap();
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "id", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "order_id", "read").receiver_class.as_deref(), Some("order_items"));
+        assert_eq!(find_col(&p, "total", "read").receiver_class.as_deref(), Some("order_items"));
+    }
+
+    #[test]
+    fn plsql_function_call_in_select_is_not_a_column_read() {
+        let p = parse_plsql(
+            "BEGIN\n  SELECT ROUND(total, 2), NULLIF(status, 'x') FROM orders;\nEND;\n/\n",
+        )
+        .unwrap();
+        assert!(p.calls.iter().all(|c| c.name != "round" && c.name != "nullif"));
+        assert_eq!(find_col(&p, "total", "read").receiver_class.as_deref(), Some("orders"));
+        assert_eq!(find_col(&p, "status", "read").receiver_class.as_deref(), Some("orders"));
+    }
+
     #[test]
     fn plsql_package_spec_body_and_standalone() {
         let src = "\
@@ -1781,5 +2066,3 @@ $$ LANGUAGE 'plpgsql';
         assert!(blank_dollar_delims("'not dollar'").is_none());
     }
 }
-
-
