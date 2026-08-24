@@ -207,6 +207,13 @@ stdio — no SDK dependency. Point any MCP-capable client at it:
 }
 ```
 
+maple also ships as a Claude Code plugin: `.claude-plugin/plugin.json` (name `maple`) plus
+`.mcp.json` wire the same `maple mcp .` server into the manifest shape bob and abe use for
+one-command installs (`/plugin marketplace add yonk-labs/bob` + `/plugin install bob@yonk-labs`,
+see bob's README) — but maple's repo doesn't yet carry its own `.claude-plugin/marketplace.json`
+the way bob's does, so that two-step marketplace install isn't wired up here yet. The manual
+client config above is still the way to point a client at it today.
+
 It exposes 3 tools, each refreshing the graph first so a long-lived session self-heals:
 
 | Tool | Arguments |
@@ -217,6 +224,13 @@ It exposes 3 tools, each refreshing the graph first so a long-lived session self
 
 A symbol that doesn't resolve (or any other tool-level failure) comes back as an MCP tool error, not
 a crash — the session stays alive.
+
+All three tools also take an optional `continuation_id`. Omit it on the first call; the response
+echoes one back that you can pass on later calls to thread a sequence of related queries into one
+session — the same file-based, append-only continuation-memory pattern bob/hector/abe's MCP tools
+use, with no daemon and no server-side state beyond a JSONL file (`$AGENT_THREAD_DIR`, default
+`~/.cache/agent-thread`). An unrecognized `continuation_id` comes back as a tool error, same as an
+unresolved symbol — not a crash.
 
 ## JSON output reference
 
