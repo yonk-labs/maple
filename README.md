@@ -295,6 +295,16 @@ Every query command prints one JSON object. The fields that show up across `bund
 | `changed_symbols[].caller_count` / `.caller_files` / `.callers[]` / `.callers_omitted` | Blast radius: full fan-in, capped caller list (20), and how many were cut. |
 | `files_no_symbols[]` | Files the diff touched where the edit landed outside any def/class span. |
 
+Wave L3: `kind` on `impact`'s `changed_symbols[]` now also takes `table`/`column` (alongside
+`function`/`class`) — a changed `CREATE TABLE` column's callers include every DML read/write, CTE
+reference, and (with `--orm-python`) ORM model field that maps to it, across languages. `kind` is
+the ONLY place a symbol's kind is currently exposed in JSON — `bundle`/`closure`/`enumerate`'s
+`defs[]`/`targets[]` entries don't carry it. Likewise, whether a given caller *reads* or *writes*
+the column (or is an `orm-map`) isn't its own JSON field on any command yet — the graph tracks it
+internally (`read`/`write`/`orm-map` are real `call_kind` values in the store), but today you tell
+them apart by looking at `file`/`line` (an ORM mapping's caller is a `.py` file; a DML write's
+`caller` is the enclosing procedure).
+
 ## Day 0 / new projects
 
 A brand-new repo (even a single near-empty `.py` file) works exactly like a mature one:
