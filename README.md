@@ -78,11 +78,12 @@ maple index /path/to/your/repo
 ```
 
 ```
-indexed: 309 files, 2244 symbols, 1786 imports, 14484 edges (exact 4441, ambiguous 2029, unresolved 8014) -> /path/to/your/repo/.maple/graph.db
+indexed: 871 files, 6888 symbols, 5343 imports, 51765 edges (exact 11133, ambiguous 8563, unresolved 32069) -> /path/to/your/repo/.maple/graph.db
 ```
 
 (your numbers will differ — this is a real run against a mid-size Python repo, shown so you can
-tell success from failure). Now ask it about a real symbol in your repo:
+tell success from failure; re-run periodically as the demo repo itself grows). Now ask it about a
+real symbol in your repo:
 
 ```bash
 maple enumerate /path/to/your/repo --symbol your_function_name
@@ -91,26 +92,42 @@ maple enumerate /path/to/your/repo --symbol your_function_name
 ```json
 {
   "symbol": "_observed_worker_count",
-  "def_count": 1,
+  "def_count": 2,
   "defs": [
+    {
+      "fq_name": ".worktrees.scale-remediation.src.pg_raggraph.config._observed_worker_count",
+      "name": "_observed_worker_count",
+      "file": ".worktrees/scale-remediation/src/pg_raggraph/config.py",
+      "start_line": 55,
+      "end_line": 67,
+      "signature": "def _observed_worker_count() -> int:",
+      "docstring": "Best-effort worker count from common deployment env vars."
+    },
     {
       "fq_name": "pg_raggraph.config._observed_worker_count",
       "name": "_observed_worker_count",
       "file": "src/pg_raggraph/config.py",
-      "start_line": 56,
-      "end_line": 68,
+      "start_line": 85,
+      "end_line": 97,
       "signature": "def _observed_worker_count() -> int:",
       "docstring": "Best-effort worker count from common deployment env vars."
     }
   ],
-  "caller_count": 1,
-  "caller_file_count": 1,
-  "exact": 1,
+  "caller_count": 2,
+  "caller_file_count": 2,
+  "exact": 2,
   "ambiguous": 0,
   "unresolved": 0,
-  "unparsed_files_count": 5
+  "unparsed_files_count": 15
 }
 ```
+
+(`def_count` is 2 here, not the 1 you'll usually see, because this particular checkout has a git
+worktree checked in under `.worktrees/` — a byte-identical second copy of the file. Both are real,
+distinct defs; each keeps its own callers, correctly. If your repo doesn't have that quirk, expect
+1. `path.py::name` and bare `name` both suffix-match a file path, so either form still returns
+both copies here — `path.py:LINE` is the one that actually pins a single def, since it also filters
+by which span the line falls inside.)
 
 And assemble a task-ready bundle for it:
 
@@ -119,7 +136,7 @@ maple bundle /path/to/your/repo --symbol your_function_name --format prompt
 ```
 
 ````
-# Target: pg_raggraph.config._observed_worker_count (src/pg_raggraph/config.py:56-68)
+# Target: .worktrees.scale-remediation.src.pg_raggraph.config._observed_worker_count (.worktrees/scale-remediation/src/pg_raggraph/config.py:55-67)
 ```python
 def _observed_worker_count() -> int:
     """Best-effort worker count from common deployment env vars."""
@@ -130,8 +147,14 @@ def _observed_worker_count() -> int:
 ## Direct callees
 - `get`  (ambiguous)
 - `int`  (unresolved/external)
-## Callers (1 total; 1 shown; tests first)
-### src/pg_raggraph/config.py:202 in model_post_init()
+## Callers (2 total; 2 shown; tests first)
+### .worktrees/scale-remediation/src/pg_raggraph/config.py:181 in model_post_init()
+```python
+        workers = _observed_worker_count()
+        fleet_connections = self.pool_max * workers
+        ...
+```
+### src/pg_raggraph/config.py:252 in model_post_init()
 ```python
         workers = _observed_worker_count()
         fleet_connections = self.pool_max * workers
@@ -147,7 +170,10 @@ whatever changed on disk since the last index/query, so you never need to rememb
 `<repo>` is a path to the repo root; state lives in `<repo>/.maple/graph.db`. The full target-spec
 grammar (bare `name` · `path.py::name` · `path.py:LINE` · `module.path.name` / `Class.method`) is
 honored by `closure`, `enumerate`, and `bundle`. `exists` and `surface` take a bare name/module
-instead — see their entries below.
+instead — see their entries below. `path.py` in any of these matches by path SUFFIX (so a short
+relative path still finds a file nested deeper), which means it does NOT disambiguate two
+identically-named files at different depths (e.g. a vendored copy or a checked-in git worktree) —
+only `path.py:LINE` narrows to one, since it also filters by which def's span contains that line.
 
 | Command | What it does |
 |---|---|
