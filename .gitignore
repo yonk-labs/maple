@@ -19,3 +19,4 @@ skill-output/
 
 # bob run artifacts (worktrees, events.jsonl) — this repo is now bob-buildable via its own MCP server
 .bob/
+skill-output/
