@@ -78,7 +78,7 @@ maple index /path/to/your/repo
 ```
 
 ```
-indexed: 871 files, 6888 symbols, 5343 imports, 51765 edges (exact 11133, ambiguous 8563, unresolved 32069) -> /path/to/your/repo/.maple/graph.db
+indexed: 365 files, 2829 symbols, 2139 imports, 17989 edges (exact 5472, ambiguous 2699, unresolved 9818) -> /path/to/your/repo/.maple/graph.db
 ```
 
 (your numbers will differ — this is a real run against a mid-size Python repo, shown so you can
@@ -92,17 +92,8 @@ maple enumerate /path/to/your/repo --symbol your_function_name
 ```json
 {
   "symbol": "_observed_worker_count",
-  "def_count": 2,
+  "def_count": 1,
   "defs": [
-    {
-      "fq_name": ".worktrees.scale-remediation.src.pg_raggraph.config._observed_worker_count",
-      "name": "_observed_worker_count",
-      "file": ".worktrees/scale-remediation/src/pg_raggraph/config.py",
-      "start_line": 55,
-      "end_line": 67,
-      "signature": "def _observed_worker_count() -> int:",
-      "docstring": "Best-effort worker count from common deployment env vars."
-    },
     {
       "fq_name": "pg_raggraph.config._observed_worker_count",
       "name": "_observed_worker_count",
@@ -113,21 +104,18 @@ maple enumerate /path/to/your/repo --symbol your_function_name
       "docstring": "Best-effort worker count from common deployment env vars."
     }
   ],
-  "caller_count": 2,
-  "caller_file_count": 2,
-  "exact": 2,
+  "caller_count": 1,
+  "caller_file_count": 1,
+  "exact": 1,
   "ambiguous": 0,
   "unresolved": 0,
-  "unparsed_files_count": 15
+  "unparsed_files_count": 5
 }
 ```
 
-(`def_count` is 2 here, not the 1 you'll usually see, because this particular checkout has a git
-worktree checked in under `.worktrees/` — a byte-identical second copy of the file. Both are real,
-distinct defs; each keeps its own callers, correctly. If your repo doesn't have that quirk, expect
-1. `path.py::name` and bare `name` both suffix-match a file path, so either form still returns
-both copies here — `path.py:LINE` is the one that actually pins a single def, since it also filters
-by which span the line falls inside.)
+(Inside a git repo, maple indexes the files git would: gitignored paths and nested repos/worktrees
+are skipped, so a local `.venv-*` or a worktree under `.worktrees/` doesn't turn every def into a
+duplicate. Outside a git repo it walks the directory.)
 
 And assemble a task-ready bundle for it:
 
@@ -136,7 +124,7 @@ maple bundle /path/to/your/repo --symbol your_function_name --format prompt
 ```
 
 ````
-# Target: .worktrees.scale-remediation.src.pg_raggraph.config._observed_worker_count (.worktrees/scale-remediation/src/pg_raggraph/config.py:55-67)
+# Target: pg_raggraph.config._observed_worker_count (src/pg_raggraph/config.py:85-97)
 ```python
 def _observed_worker_count() -> int:
     """Best-effort worker count from common deployment env vars."""
@@ -147,13 +135,7 @@ def _observed_worker_count() -> int:
 ## Direct callees
 - `get`  (ambiguous)
 - `int`  (unresolved/external)
-## Callers (2 total; 2 shown; tests first)
-### .worktrees/scale-remediation/src/pg_raggraph/config.py:181 in model_post_init()
-```python
-        workers = _observed_worker_count()
-        fleet_connections = self.pool_max * workers
-        ...
-```
+## Callers (1 total; 1 shown; tests first)
 ### src/pg_raggraph/config.py:252 in model_post_init()
 ```python
         workers = _observed_worker_count()
@@ -172,7 +154,7 @@ grammar (bare `name` · `path.py::name` · `path.py:LINE` · `module.path.name` 
 honored by `closure`, `enumerate`, and `bundle`. `exists` and `surface` take a bare name/module
 instead — see their entries below. `path.py` in any of these matches by path SUFFIX (so a short
 relative path still finds a file nested deeper), which means it does NOT disambiguate two
-identically-named files at different depths (e.g. a vendored copy or a checked-in git worktree) —
+identically-named files at different depths (e.g. a vendored copy) —
 only `path.py:LINE` narrows to one, since it also filters by which def's span contains that line.
 
 | Command | What it does |
