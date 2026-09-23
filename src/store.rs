@@ -1108,7 +1108,7 @@ impl Store {
                         cand.dedup();
                         candidate_paths = Some(
                             cand.into_iter()
-                                .filter(|p| crate::parser::lang_for_path(Path::new(p), sql).is_some())
+                                .filter(|p| !in_skip_dir(Path::new(p)) && crate::parser::lang_for_path(Path::new(p), sql).is_some())
                                 .collect(),
                         );
                     }
@@ -2141,6 +2141,11 @@ fn source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Vec<Path
     out
 }
 
+/// Any path component is a SKIP_DIRS name — the one scope rule cold index and refresh share.
+fn in_skip_dir(rel: &Path) -> bool {
+    rel.components().any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
+}
+
 /// Tracked + untracked-not-ignored files under `root` (`git ls-files -co --exclude-standard`), so
 /// `.gitignore`/`info/exclude`/global excludes apply exactly as git applies them, and a nested repo
 /// or worktree (e.g. `.claude/worktrees/*`) is one opaque dir entry git never descends into.
@@ -2161,7 +2166,7 @@ fn git_source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Opti
         .split(|b| *b == 0)
         .filter(|rel| !rel.is_empty())
         .map(|rel| PathBuf::from(String::from_utf8_lossy(rel).into_owned()))
-        .filter(|rel| !rel.components().any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref())))
+        .filter(|rel| !in_skip_dir(rel))
         .filter(|rel| crate::parser::lang_for_path(rel, sql).is_some())
         .map(|rel| root.join(rel))
         .filter(|p| p.is_file()) // tracked-but-deleted paths are still in the index
@@ -3501,6 +3506,27 @@ mod tests {
         };
         assert_eq!(rel(root), vec!["a.py", "untracked.py"]);
         assert_eq!(rel(&root.join("nested")), vec!["c.py"]);
+    }
+
+    /// T12 fast path (HEAD unchanged, candidates from `git status`) applies SKIP_DIRS exactly like
+    /// a cold index: editing a tracked `vendor/` file must not pull it into the graph on refresh.
+    #[test]
+    fn refresh_fast_path_honors_skip_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        fs::write(root.join("a.py"), "def f(): pass\n").unwrap();
+        fs::write(root.join("vendor/v.py"), "def g(): pass\n").unwrap();
+        git(root, &["init", "-q"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+
+        fs::write(root.join("vendor/v.py"), "def g2(): pass\n").unwrap();
+        let st = s.refresh().unwrap();
+        let n: i64 = s.conn.query_row("SELECT count(*) FROM files WHERE path LIKE 'vendor/%'", [], |r| r.get(0)).unwrap();
+        assert_eq!((st.changed, n), (0, 0), "vendor/ edit stays out of the graph on refresh");
     }
 
     /// A `.gitignore` that hides every source file must not turn `maple index` into a silent
