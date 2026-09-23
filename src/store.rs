@@ -2112,9 +2112,11 @@ fn hash_bytes(b: &[u8]) -> String {
 /// when the store has a configured dialect.
 ///
 /// Inside a git repo the file set is git's own (`git_source_files`): gitignored paths and nested
-/// repos/worktrees are out. The raw directory walk below is the non-git fallback.
+/// repos/worktrees are out. The raw directory walk below is the non-git fallback — also taken when
+/// git lists zero source files (e.g. a blanket `*` .gitignore), so that case can't silently index
+/// nothing.
 fn source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Vec<PathBuf> {
-    if let Some(files) = git_source_files(root, sql) {
+    if let Some(files) = git_source_files(root, sql).filter(|f| !f.is_empty()) {
         return files;
     }
     let mut out = Vec::new();
@@ -3499,6 +3501,19 @@ mod tests {
         };
         assert_eq!(rel(root), vec!["a.py", "untracked.py"]);
         assert_eq!(rel(&root.join("nested")), vec!["c.py"]);
+    }
+
+    /// A `.gitignore` that hides every source file must not turn `maple index` into a silent
+    /// 0-file success — git's empty answer falls back to the directory walk.
+    #[test]
+    fn source_files_fall_back_to_walk_when_git_lists_no_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.py"), "def f(): pass\n").unwrap();
+        fs::write(root.join(".gitignore"), "*\n").unwrap();
+        git(root, &["init", "-q"]);
+        let files = source_files(root, None);
+        assert_eq!(files, vec![root.join("a.py")]);
     }
 
     // ---- L1.4 — per-language universal-tier fixtures ---------------------------------------
