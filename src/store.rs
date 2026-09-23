@@ -2110,7 +2110,13 @@ fn hash_bytes(b: &[u8]) -> String {
 /// L1.1 — every file under `root` (skip dirs excluded) whose extension is registered in
 /// `parser::LANGS`. The generalized `python_files` walker. L2.1: `.sql` files are yielded only
 /// when the store has a configured dialect.
+///
+/// Inside a git repo the file set is git's own (`git_source_files`): gitignored paths and nested
+/// repos/worktrees are out. The raw directory walk below is the non-git fallback.
 fn source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Vec<PathBuf> {
+    if let Some(files) = git_source_files(root, sql) {
+        return files;
+    }
     let mut out = Vec::new();
     fn rec(dir: &Path, out: &mut Vec<PathBuf>, sql: Option<crate::parser::SqlDialect>) {
         let rd = match std::fs::read_dir(dir) {
@@ -2131,6 +2137,36 @@ fn source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Vec<Path
     }
     rec(root, &mut out, sql);
     out
+}
+
+/// Tracked + untracked-not-ignored files under `root` (`git ls-files -co --exclude-standard`), so
+/// `.gitignore`/`info/exclude`/global excludes apply exactly as git applies them, and a nested repo
+/// or worktree (e.g. `.claude/worktrees/*`) is one opaque dir entry git never descends into.
+/// SKIP_DIRS still filters (tracked `vendor/`, `target/` stay out, same as the walk). `None` when
+/// `root` isn't in a git repo or git isn't installed — the caller falls back to the walk.
+fn git_source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Option<Vec<PathBuf>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "-co", "--exclude-standard"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|rel| !rel.is_empty())
+        .map(|rel| PathBuf::from(String::from_utf8_lossy(rel).into_owned()))
+        .filter(|rel| !rel.components().any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref())))
+        .filter(|rel| crate::parser::lang_for_path(rel, sql).is_some())
+        .map(|rel| root.join(rel))
+        .filter(|p| p.is_file()) // tracked-but-deleted paths are still in the index
+        .collect();
+    files.sort();
+    files.dedup(); // an unmerged path is listed once per conflict stage
+    Some(files)
 }
 
 #[cfg(test)]
@@ -3439,6 +3475,30 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Inside a git repo, `source_files` is git's view of the repo: gitignored dirs and nested
+    /// repos/worktrees (e.g. `.claude/worktrees/*`) are out, untracked-but-not-ignored files are in,
+    /// SKIP_DIRS still applies to tracked paths — and the nested repo indexes fine as its own root.
+    #[test]
+    fn source_files_follow_git_ignore_rules_and_skip_nested_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for f in ["a.py", "untracked.py", "ignored_dir/b.py", "vendor/v.py", "nested/c.py"] {
+            fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+            fs::write(root.join(f), "def f(): pass\n").unwrap();
+        }
+        fs::write(root.join(".gitignore"), "ignored_dir/\n").unwrap();
+        git(root, &["init", "-q"]);
+        git(&root.join("nested"), &["init", "-q"]);
+        git(root, &["add", "a.py", ".gitignore", "vendor/v.py"]);
+        git(root, &["commit", "-qm", "init"]);
+
+        let rel = |r: &Path| -> Vec<String> {
+            source_files(r, None).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(rel(root), vec!["a.py", "untracked.py"]);
+        assert_eq!(rel(&root.join("nested")), vec!["c.py"]);
     }
 
     // ---- L1.4 — per-language universal-tier fixtures ---------------------------------------
