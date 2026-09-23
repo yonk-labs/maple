@@ -1904,7 +1904,7 @@ fn resolve_call(
                 if cands.len() > 1 && lang == "python" && is_external_receiver(conn, rc, call_site_file)? {
                     return Ok((None, "unresolved"));
                 }
-            } else if hint_names_a_class(&kinds, lang) {
+            } else if hint_names_a_class(&kinds, lang) && !rust_hint_may_be_trait(conn, rc, lang)? {
                 let filt: Vec<&(i64, Option<String>, String)> =
                     cands.iter().filter(|(_, pc, _)| pc.as_deref() == Some(rc)).collect();
                 match filt.len() {
@@ -1974,6 +1974,30 @@ fn hint_names_a_class(kinds: &[String], lang: &str) -> bool {
     } else {
         kinds.len() == 1 && kinds[0] == "class"
     }
+}
+
+/// A Rust trait is stored as a class-kind container (its default methods need a parent), but a
+/// hint naming it names the interface, not the code that runs: `Trait::m(&x)`, or `self.m()` inside
+/// a default method, dispatches to whichever implementor's override applies. So a trait hint never
+/// narrows; the universal answer stands (exact only when `m` is unique). Only the first line of a
+/// def is stored, so this fails safe: the hint narrows only when that line positively shows
+/// `struct`/`enum`/`union` (keywords, so the first one there is the item's own). A header split
+/// before its keyword (`pub\ntrait X`) counts as maybe-a-trait.
+fn rust_hint_may_be_trait(conn: &Connection, rc: &str, lang: &str) -> Result<bool> {
+    if lang != "rust" {
+        return Ok(false);
+    }
+    let sig: Option<String> = conn
+        .prepare_cached("SELECT signature FROM symbols WHERE name=?1 AND lang='rust' AND kind='class' LIMIT 1")?
+        .query_row([rc], |r| r.get(0))
+        .optional()?
+        .flatten();
+    Ok(!sig.is_some_and(|s| {
+        matches!(
+            s.split_whitespace().find(|t| matches!(*t, "struct" | "enum" | "union" | "trait")),
+            Some("struct" | "enum" | "union")
+        )
+    }))
 }
 
 /// T4 — single-hop inheritance: `rc` (already validated as a class with no own method `name`)
@@ -3560,6 +3584,29 @@ mod tests {
         s.conn
             .query_row("SELECT parent_class FROM symbols WHERE name=?1", [name], |r| r.get(0))
             .unwrap()
+    }
+
+    /// A trait is a class-kind container, but a hint naming it names the interface, not the code
+    /// that runs: `self.bye()` in a default method dispatches to an implementor's override. So a
+    /// trait hint never narrows — ambiguous when overrides exist, exact only when the name is unique.
+    #[test]
+    fn rust_trait_hint_never_narrows_to_the_default_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub trait Greet {\n    fn hi(&self) -> i32 { self.bye() }\n    fn bye(&self) -> i32 { 0 }\n\
+             \x20   fn hi2(&self) -> i32 { self.only() }\n    fn only(&self) -> i32 { 0 }\n}\n\
+             pub struct B;\nimpl Greet for B { fn bye(&self) -> i32 { 1 } }\n\
+             pub\ntrait\nSplit { fn go(&self) -> i32 { self.run() } fn run(&self) -> i32 { 0 } }\n\
+             impl Split for B { fn run(&self) -> i32 { 1 } }\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(edge_kinds(&s, "bye", "hi").0, "ambiguous", "B overrides bye -> not the default");
+        assert_eq!(edge_kinds(&s, "only", "hi2").0, "exact", "unique name still exact");
+        assert_eq!(edge_kinds(&s, "run", "go").0, "ambiguous", "`trait` off line 1 still never narrows");
     }
 
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind
