@@ -3636,6 +3636,43 @@ mod tests {
         assert_eq!(widget_kind, "class", "struct is a class-kind container");
     }
 
+    /// Rust `T::new()` / `m::T::new()` / `Self::new()` name their type in the call itself — a
+    /// syntactically free hint that picks T's `new` out of every same-named def. A hint naming a
+    /// type with no such method stays ambiguous (never guessed), and so does a trait-qualified
+    /// `Trait::m(&x)`, which dispatches to the implementor's override, not the trait default.
+    #[test]
+    fn rust_path_call_type_is_the_receiver_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub struct A;\npub struct B;\npub struct C;\n\
+             impl A { pub fn new() -> Self { A } fn make() -> Self { Self::new() } }\n\
+             impl B { pub fn new() -> Self { B } }\n\
+             fn mk_a() { A::new(); }\nfn mk_b() { m::B::new(); }\nfn mk_c() { C::new(); }\n\
+             pub trait Greet { fn bye(&self) -> i32 { 0 } }\nimpl Greet for B { fn bye(&self) -> i32 { 1 } }\n\
+             fn ufcs() { Greet::bye(&B); }\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        let new_in = |encl: &str| -> (String, Option<String>) {
+            s.conn
+                .query_row(
+                    "SELECT e.kind, t.parent_class FROM edges e JOIN symbols c ON e.caller_symbol=c.id \
+                     LEFT JOIN symbols t ON e.callee_symbol=t.id WHERE e.callee_name='new' AND c.name=?1",
+                    [encl],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(new_in("mk_a"), ("exact".into(), Some("A".into())), "T::new()");
+        assert_eq!(new_in("mk_b"), ("exact".into(), Some("B".into())), "m::T::new()");
+        assert_eq!(new_in("make"), ("exact".into(), Some("A".into())), "Self::new() inside impl A");
+        assert_eq!(new_in("mk_c"), ("ambiguous".into(), None), "C has no new -> not guessed");
+        assert_eq!(edge_kinds(&s, "bye", "ufcs").0, "ambiguous", "Trait::m(&x) is not the trait default");
+    }
+
     /// L1.4 Go — cross-file func call exact; `w.foo()` on the method's own receiver ident gets the
     /// receiver-type hint and lands kind `method`; defs carry the receiver type as parent.
     #[test]

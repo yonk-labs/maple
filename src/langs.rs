@@ -185,11 +185,19 @@ fn walk_rust<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: RustCtx<'
                             push_call(out, text(field, src), "method", node, ctx.enclosing, recv);
                         }
                     }
-                    // `X::y(...)` — resolve by the member name only; no receiver hint (spec: hints
-                    // are Go receivers + Rust `self` only, everything else None).
+                    // `T::y()` / `m::T::y()` name their type in the call itself — syntactically
+                    // free (L1 rule), so T is the hint; `Self::y()` is the impl type. A module
+                    // path (`fs::read`) hints a name that isn't one class symbol, which the
+                    // resolver already distrusts -> same universal answer as no hint.
                     "scoped_identifier" => {
                         if let Some(name) = f.child_by_field_name("name") {
-                            push_call(out, text(name, src), "method", node, ctx.enclosing, None);
+                            let recv = f.child_by_field_name("path").and_then(|p| match p.kind() {
+                                "identifier" if text(p, src) == "Self" => ctx.self_class.map(str::to_string),
+                                "identifier" => Some(text(p, src).to_string()),
+                                "scoped_identifier" => p.child_by_field_name("name").map(|n| text(n, src).to_string()),
+                                _ => None,
+                            });
+                            push_call(out, text(name, src), "method", node, ctx.enclosing, recv);
                         }
                     }
                     _ => {}
