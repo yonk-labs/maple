@@ -13,6 +13,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+/// Which-files-are-in-scope rule version, stamped into `meta.file_scope` (see `record_git_state`).
+/// Bump it whenever that rule changes: a store without the current stamp skips refresh's git fast
+/// path once, and that full walk's deletion pass drops rows the old rule let in. 1 = git ls-files
+/// + SKIP_DIRS on both index and refresh; 2 = + .gitattributes linguist-generated/-vendored.
+const FILE_SCOPE: &str = "2";
+
 const SKIP_DIRS: &[&str] = &[
     ".git", ".maple", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", "target",
     ".mypy_cache", "vendor",
@@ -1087,7 +1093,11 @@ impl Store {
                     .conn
                     .query_row("SELECT value FROM meta WHERE key='last_indexed_head'", [], |r| r.get(0))
                     .optional()?;
-                if stored_head.as_deref() == Some(head.as_str()) {
+                let stored_scope: Option<String> = self
+                    .conn
+                    .query_row("SELECT value FROM meta WHERE key='file_scope'", [], |r| r.get(0))
+                    .optional()?;
+                if stored_head.as_deref() == Some(head.as_str()) && stored_scope.as_deref() == Some(FILE_SCOPE) {
                     if let Some(status) = git_status_porcelain(&root) {
                         let mut cand = parse_porcelain_paths(&status);
                         porcelain_snapshot = Some(status);
@@ -1106,11 +1116,12 @@ impl Store {
                         }
                         cand.sort();
                         cand.dedup();
-                        candidate_paths = Some(
-                            cand.into_iter()
-                                .filter(|p| !in_skip_dir(Path::new(p)) && crate::parser::lang_for_path(Path::new(p), sql).is_some())
-                                .collect(),
-                        );
+                        let cand: Vec<String> = cand
+                            .into_iter()
+                            .filter(|p| !in_skip_dir(Path::new(p)) && crate::parser::lang_for_path(Path::new(p), sql).is_some())
+                            .collect();
+                        let not_ours = linguist_not_ours(&root, &cand);
+                        candidate_paths = Some(cand.into_iter().filter(|p| !not_ours.contains(p)).collect());
                     }
                 }
                 observed_head = Some(head);
@@ -1614,6 +1625,12 @@ fn record_git_state(conn: &Connection, root: &Path, head: &str, status: Option<&
         "INSERT INTO meta(key,value) VALUES('last_indexed_head',?1) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [head],
+    )?;
+    // safe to stamp on every call: the fast path requires the stamp, so reaching here unstamped
+    // means this pass was a cold index or a full walk, both of which applied the current scope.
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('file_scope',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [FILE_SCOPE],
     )?;
     let fetched;
     let status = match status {
@@ -2138,11 +2155,13 @@ fn hash_bytes(b: &[u8]) -> String {
 /// Inside a git repo the file set is git's own (`git_source_files`): gitignored paths and nested
 /// repos/worktrees are out. The raw directory walk below is the non-git fallback — also taken when
 /// git lists zero source files (e.g. a blanket `*` .gitignore), so that case can't silently index
-/// nothing.
+/// nothing — and says so on stderr when the walk does find files, since .gitignore isn't applied.
 fn source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Vec<PathBuf> {
-    if let Some(files) = git_source_files(root, sql).filter(|f| !f.is_empty()) {
-        return files;
-    }
+    let git_listed_none = match git_source_files(root, sql) {
+        Some(files) if !files.is_empty() => return files,
+        Some(_) => true,
+        None => false,
+    };
     let mut out = Vec::new();
     fn rec(dir: &Path, out: &mut Vec<PathBuf>, sql: Option<crate::parser::SqlDialect>) {
         let rd = match std::fs::read_dir(dir) {
@@ -2162,6 +2181,12 @@ fn source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Vec<Path
         }
     }
     rec(root, &mut out, sql);
+    if git_listed_none && !out.is_empty() {
+        eprintln!(
+            "maple: git lists no source files under {}; indexed via directory walk (.gitignore not applied)",
+            root.display()
+        );
+    }
     out
 }
 
@@ -2170,10 +2195,53 @@ fn in_skip_dir(rel: &Path) -> bool {
     rel.components().any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
 }
 
+/// The subset of `rels` (root-relative) the repo's .gitattributes marks as not its own code —
+/// GitHub linguist's `linguist-generated` / `linguist-vendored`, set or `=true` (an explicit
+/// `=false` keeps a file in). E.g. vendored tree-sitter `parser.c` tables: one 60 MB file parses to
+/// ~1.3M macro "calls". Any git error -> empty set (nothing filtered, never a lost file).
+fn linguist_not_ours(root: &Path, rels: &[String]) -> std::collections::HashSet<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut out = std::collections::HashSet::new();
+    if rels.is_empty() {
+        return out;
+    }
+    let Ok(mut child) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-attr", "-z", "--stdin", "linguist-generated", "linguist-vendored"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return out;
+    };
+    let input: Vec<u8> = rels.iter().flat_map(|r| r.bytes().chain(std::iter::once(0))).collect();
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    // written from a thread: check-attr streams answers as it reads, so a big list would deadlock
+    // on full pipes if we wrote everything before reading
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let Ok(res) = child.wait_with_output() else { return out };
+    let _ = writer.join();
+    if !res.status.success() {
+        return out;
+    }
+    // -z output: <path> NUL <attr> NUL <value> NUL, per path per attribute
+    let fields: Vec<&[u8]> = res.stdout.split(|b| *b == 0).collect();
+    for t in fields.chunks(3) {
+        if t.len() == 3 && (t[2] == b"set" || t[2] == b"true") {
+            out.insert(String::from_utf8_lossy(t[0]).into_owned());
+        }
+    }
+    out
+}
+
 /// Tracked + untracked-not-ignored files under `root` (`git ls-files -co --exclude-standard`), so
 /// `.gitignore`/`info/exclude`/global excludes apply exactly as git applies them, and a nested repo
 /// or worktree (e.g. `.claude/worktrees/*`) is one opaque dir entry git never descends into.
-/// SKIP_DIRS still filters (tracked `vendor/`, `target/` stay out, same as the walk). `None` when
+/// SKIP_DIRS still filters (tracked `vendor/`, `target/` stay out, same as the walk), and so do
+/// files .gitattributes marks linguist-generated/-vendored (`linguist_not_ours`). `None` when
 /// `root` isn't in a git repo or git isn't installed — the caller falls back to the walk.
 fn git_source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Option<Vec<PathBuf>> {
     let out = std::process::Command::new("git")
@@ -2185,13 +2253,18 @@ fn git_source_files(root: &Path, sql: Option<crate::parser::SqlDialect>) -> Opti
     if !out.status.success() {
         return None;
     }
-    let mut files: Vec<PathBuf> = out
+    let rels: Vec<String> = out
         .stdout
         .split(|b| *b == 0)
         .filter(|rel| !rel.is_empty())
-        .map(|rel| PathBuf::from(String::from_utf8_lossy(rel).into_owned()))
-        .filter(|rel| !in_skip_dir(rel))
-        .filter(|rel| crate::parser::lang_for_path(rel, sql).is_some())
+        .map(|rel| String::from_utf8_lossy(rel).into_owned())
+        .filter(|rel| !in_skip_dir(Path::new(rel)))
+        .filter(|rel| crate::parser::lang_for_path(Path::new(rel), sql).is_some())
+        .collect();
+    let not_ours = linguist_not_ours(root, &rels);
+    let mut files: Vec<PathBuf> = rels
+        .into_iter()
+        .filter(|rel| !not_ours.contains(rel))
         .map(|rel| root.join(rel))
         .filter(|p| p.is_file()) // tracked-but-deleted paths are still in the index
         .collect();
@@ -3551,6 +3624,63 @@ mod tests {
         let st = s.refresh().unwrap();
         let n: i64 = s.conn.query_row("SELECT count(*) FROM files WHERE path LIKE 'vendor/%'", [], |r| r.get(0)).unwrap();
         assert_eq!((st.changed, n), (0, 0), "vendor/ edit stays out of the graph on refresh");
+    }
+
+    /// A store from before the current file-scope rule (no `file_scope` stamp) may hold rows the old
+    /// rule let in. HEAD unchanged would normally take the fast path, which never sees them; the
+    /// missing stamp forces one full walk, whose deletion pass drops them, and stamps the store.
+    #[test]
+    fn refresh_drops_out_of_scope_rows_from_an_older_store_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        fs::write(root.join("a.py"), "def f(): pass\n").unwrap();
+        fs::write(root.join("vendor/v.py"), "def g(): pass\n").unwrap();
+        git(root, &["init", "-q"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        // what an older maple left behind: an out-of-scope row, and no scope stamp
+        s.conn.execute("INSERT INTO files(path,hash,lang) VALUES('vendor/v.py','old','python')", []).unwrap();
+        s.conn.execute("DELETE FROM meta WHERE key='file_scope'", []).unwrap();
+
+        let st = s.refresh().unwrap();
+        let n: i64 = s.conn.query_row("SELECT count(*) FROM files WHERE path='vendor/v.py'", [], |r| r.get(0)).unwrap();
+        assert_eq!((st.deleted, n), (1, 0), "stale out-of-scope row dropped on the first refresh");
+        let st2 = s.refresh().unwrap();
+        assert_eq!((st2.changed, st2.deleted), (0, 0), "stamped: next refresh is a clean no-op");
+    }
+
+    /// Files the repo marks as not its own in .gitattributes (`linguist-generated` /
+    /// `linguist-vendored`, set or `=true`) stay out of both a cold index and a refresh; an explicit
+    /// `=false` keeps a file in.
+    #[test]
+    fn linguist_generated_and_vendored_files_are_out_of_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for f in ["a.py", "gen/g.py", "gen/keep.py", "third/t.py"] {
+            fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+            fs::write(root.join(f), "def f(): pass\n").unwrap();
+        }
+        fs::write(
+            root.join(".gitattributes"),
+            "gen/** linguist-generated=true\ngen/keep.py linguist-generated=false\nthird/** linguist-vendored\n",
+        )
+        .unwrap();
+        git(root, &["init", "-q"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        let rel = |r: &Path| -> Vec<String> {
+            source_files(r, None).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(rel(root), vec!["a.py", "gen/keep.py"]);
+
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        fs::write(root.join("gen/g.py"), "def g2(): pass\n").unwrap();
+        let st = s.refresh().unwrap();
+        assert_eq!(st.changed, 0, "editing a generated file doesn't pull it in on refresh");
     }
 
     /// A `.gitignore` that hides every source file must not turn `maple index` into a silent
