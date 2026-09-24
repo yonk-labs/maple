@@ -631,7 +631,55 @@ fn parse_js_family(src: &str, language: Language, what: &str) -> anyhow::Result<
     let tree = tree_for(src, language, what)?;
     let mut out = ParsedFile::default();
     walk_js(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
+    // a `global:X` hint only stands if this file never declares its own `X` (then it's that binding)
+    let declared = js_declared_names(tree.root_node(), src.as_bytes());
+    for c in &mut out.calls {
+        if c.receiver_class.as_deref().and_then(|r| r.strip_prefix("global:")).is_some_and(|g| declared.contains(g)) {
+            c.receiver_class = None;
+        }
+    }
     Ok(out)
+}
+
+/// Built-in global objects of the JS runtimes (browser + Node): `Promise.all()`, `Math.max()`,
+/// `console.log()` can only be repo code if the file shadows the name, which `js_declared_names`
+/// rules out.
+const JS_GLOBALS: &[&str] = &[
+    "Promise", "Math", "JSON", "Object", "Array", "console", "Number", "String", "Boolean", "Date", "Reflect",
+    "Symbol", "Intl", "BigInt", "Atomics", "Error", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "Proxy",
+    "globalThis", "window", "document", "navigator", "location", "history", "localStorage", "sessionStorage",
+    "process", "Buffer", "crypto", "performance", "URL",
+];
+
+/// Every name this file declares anywhere (variables incl. destructuring, parameters, imports,
+/// catch params, function/class/enum names) — scope-blind on purpose: any declaration of `Math`
+/// anywhere in the file drops every `global:Math` hint in it (conservative).
+fn js_declared_names(root: Node, src: &[u8]) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        let decl = match n.kind() {
+            "variable_declarator" => n.child_by_field_name("name"),
+            "formal_parameters" | "import_clause" => Some(n),
+            "catch_clause" => n.child_by_field_name("parameter"),
+            "function_declaration" | "generator_function_declaration" | "class_declaration"
+            | "abstract_class_declaration" | "enum_declaration" => n.child_by_field_name("name"),
+            _ => None,
+        };
+        if let Some(d) = decl {
+            let mut inner = vec![d];
+            while let Some(x) = inner.pop() {
+                if matches!(x.kind(), "identifier" | "type_identifier" | "shorthand_property_identifier_pattern") {
+                    names.insert(text(x, src).to_string());
+                }
+                let mut c = x.walk();
+                inner.extend(x.named_children(&mut c));
+            }
+        }
+        let mut c = n.walk();
+        stack.extend(n.named_children(&mut c));
+    }
+    names
 }
 
 fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>) {
@@ -681,7 +729,13 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
                     "identifier" => push_call(out, text(f, src), "func", node, ctx.enclosing, None),
                     "member_expression" => {
                         if let Some(prop) = f.child_by_field_name("property").filter(|p| p.kind() == "property_identifier") {
-                            let recv = this_hint(f.child_by_field_name("object"), ctx);
+                            let obj = f.child_by_field_name("object");
+                            let recv = this_hint(obj, ctx).or_else(|| {
+                                obj.filter(|o| o.kind() == "identifier")
+                                    .map(|o| text(o, src))
+                                    .filter(|t| JS_GLOBALS.contains(t))
+                                    .map(|t| format!("global:{t}"))
+                            });
                             push_call(out, text(prop, src), "method", node, ctx.enclosing, recv);
                         }
                     }

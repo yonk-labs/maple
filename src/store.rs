@@ -1910,6 +1910,10 @@ fn resolve_call(
                     return Ok(hit);
                 }
             }
+            // JS/TS built-in global object the file doesn't shadow (parser hint `global:<name>`)
+            if rc.starts_with("global:") {
+                return Ok((None, "unresolved"));
+            }
             // hint is trusted only if `rc` names exactly one same-language symbol and it's a class.
             // Java/C#/C++ constructors share their class's name (`Foo::Foo`), so they don't count.
             let mut cstmt = conn.prepare_cached(
@@ -4114,6 +4118,26 @@ mod tests {
         assert_eq!(target("run", "jgo"), ("exact".into(), Some("J1".into())), "java extends");
         assert_eq!(target("Tick", "CGo"), ("exact".into(), Some("C1".into())), "c# base list");
         assert_eq!(target("step", "pgo"), ("exact".into(), Some("P1".into())), "c++ base clause");
+    }
+
+    /// JS/TS built-in global objects (`Promise.all`, `console.log`) are external -> unresolved,
+    /// unless the file itself declares that name (then it's the file's own binding, not the global).
+    #[test]
+    fn js_global_object_calls_are_unresolved_unless_shadowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("lib.ts"), "export function all(xs: any) {}\nexport function log(m: string) {}\n").unwrap();
+        fs::write(
+            root.join("use.ts"),
+            "function waitAll(ps: any) { Promise.all(ps); }\nfunction say() { console.log('x'); }\n",
+        )
+        .unwrap();
+        fs::write(root.join("shadow.js"), "const Math = { max() {} };\nfunction f() { Math.max(1); }\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(edge_kinds(&s, "all", "waitAll").0, "unresolved", "Promise.all is the global's");
+        assert_eq!(edge_kinds(&s, "log", "say").0, "unresolved", "console.log is the global's");
+        assert_ne!(edge_kinds(&s, "max", "f").0, "unresolved", "file declares its own Math");
     }
 
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind
