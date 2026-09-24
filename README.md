@@ -417,14 +417,14 @@ builtin (`unresolved`). See [DECISIONS.md](DECISIONS.md).
 
 | Language | Extensions | Defs + containers | func/method calls | Imports/aliases | Receiver hints | Docstrings |
 |---|---|---|---|---|---|---|
-| Python | `.py` | ✓ classes | ✓ | ✓ `import`/`from`/`as` | ✓ full exact resolver (S2/T1–T4) | ✓ |
+| Python | `.py` | ✓ classes | ✓ | ✓ `import`/`from`/`as` | ✓ full exact resolver (S2/T1–T4); `m.f()` on an imported module → that module's def, or unresolved when the module isn't in the repo | ✓ |
 | Rust | `.rs` | ✓ struct/enum/trait + `impl` blocks | ✓ (`X::y` counts as method) | ✓ `use`, `use .. as` | `self.foo()` in `impl T` → T; `T::y()` / `m::T::y()` / `Self::y()` → T. A trait never narrows (`Trait::m(&x)` stays ambiguous); a std type (`Vec::new()`) → unresolved | ✓ `///` |
 | C | `.c` `.h` | ✓ (no classes) | all `func` (C has no methods) | `#include` raw only | — | — |
-| C++ | `.cpp` `.cc` `.hpp` `.hh` | ✓ class/struct + out-of-line `X::y` defs | ✓ | `#include` raw only | — | — |
-| C# | `.cs` | ✓ class/interface/struct/record | ✓ | ✓ `using`, `using X = Y` | — | ✓ `///` / `/** */` |
-| Java | `.java` | ✓ class/interface/enum/record | ✓ | ✓ imports (last segment) | — | ✓ `/** */` |
-| JavaScript | `.js` `.jsx` `.mjs` `.cjs` | ✓ classes + `const x = () =>` arrows | ✓ | ✓ `import {a as b}`, defaults | — | ✓ `/** */` |
-| TypeScript | `.ts` `.tsx` | ✓ (TS + TSX grammars, one language) | ✓ | ✓ `import {a as b}`, defaults | — | ✓ `/** */` |
+| C++ | `.cpp` `.cc` `.hpp` `.hh` | ✓ class/struct + out-of-line `X::y` defs | ✓ | `#include` raw only | `this->foo()` → enclosing class (+ one hop to its first base) | — |
+| C# | `.cs` | ✓ class/interface/struct/record | ✓ | ✓ `using`, `using X = Y` | `this.Foo()` → enclosing class (+ one hop to its first base) | ✓ `///` / `/** */` |
+| Java | `.java` | ✓ class/interface/enum/record | ✓ | ✓ imports (last segment) | `this.foo()` → enclosing class (+ one hop to its superclass) | ✓ `/** */` |
+| JavaScript | `.js` `.jsx` `.mjs` `.cjs` | ✓ classes + `const x = () =>` arrows | ✓ | ✓ `import {a as b}`, defaults | `this.foo()` → enclosing class (+ one hop to `extends`; `function(){}` rebinds `this`); `Promise`/`Math`/`console`… calls → unresolved unless the file declares the name | ✓ `/** */` |
+| TypeScript | `.ts` `.tsx` | ✓ (TS + TSX grammars, one language) | ✓ | ✓ `import {a as b}`, defaults | same as JavaScript | ✓ `/** */` |
 | Go | `.go` | ✓ named types + method receivers | ✓ | ✓ import aliases | `w.foo()` on the receiver ident → type | — |
 | PostgreSQL | `.sql`* | ✓ functions/procedures (schema as container); plpgsql + `LANGUAGE sql` dollar-quoted bodies re-parsed for calls | ✓ (`schema.fn()` → method) | — | — | — |
 | T-SQL | `.sql`* | ✓ procedures/functions/triggers (schema as container); `GO` separators handled | ✓ (`EXEC`, `dbo.proc()` → method) | — | — | — |

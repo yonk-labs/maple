@@ -31,3 +31,18 @@ free). A hint naming a trait never narrows (`Trait::m(&x)` dispatches to the imp
 fail-safe: only a stored first line that shows struct/enum/union narrows. A hint naming a std
 concrete type (`Vec`, `String`, `Arc`, …) with no in-repo reach is `unresolved`, never traits
 (`Default::default()` can dispatch into repo impls).
+
+## 2026-09-23 — More syntactically free receivers (Python modules, `this`, JS globals)
+- Python `m.f()` where `m` is import-bound in the file (`import m`, `import a.b as m`, `from p import
+  m`, incl. `a.b.f()` chains): the module's own file -> its module-level def; `from pkg import Cls`
+  -> Cls's methods; no prefix of the module path in the repo -> external -> unresolved; an in-repo
+  package that doesn't define it (re-export) -> the old universal answer, never a guess.
+- `this.m()` / `this->m()` in TS/JS/Java/C#/C++: the enclosing class is the hint, as Rust's `self`.
+  JS `function(){}` rebinds `this` (no hint); arrows keep it. The class's first base is recorded, so
+  an inherited method resolves one hop up (T4). A Java/C#/C++ constructor named like its class
+  doesn't make the hint ambiguous (it blocked 1,306 of godot's 1,335 C++ hints).
+- JS/TS built-in globals (`Promise.all`, `Math.max`, `console.log`) -> unresolved, unless the file
+  declares that name anywhere (scope-blind on purpose: conservative).
+**Measured on 18 repos vs 0.3.10:** exact +984, ambiguous -6,725 (e.g. Excalibur TS exact +495,
+bento Python ambiguous -1,954); every changed edge sits at a call site carrying one of these hints,
+and no call-site was lost.
