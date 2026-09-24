@@ -1910,8 +1910,12 @@ fn resolve_call(
                     return Ok(hit);
                 }
             }
-            // hint is trusted only if `rc` names exactly one same-language symbol and it's a class
-            let mut cstmt = conn.prepare_cached("SELECT kind FROM symbols WHERE name=?1 AND lang=?2 LIMIT 2")?;
+            // hint is trusted only if `rc` names exactly one same-language symbol and it's a class.
+            // Java/C#/C++ constructors share their class's name (`Foo::Foo`), so they don't count.
+            let mut cstmt = conn.prepare_cached(
+                "SELECT kind FROM symbols WHERE name=?1 AND lang=?2 \
+                 AND NOT (?2 IN ('java','csharp','cpp') AND kind='function' AND parent_class=?1) LIMIT 2",
+            )?;
             let kinds: Vec<String> = cstmt
                 .query_map(params![rc, lang], |r| r.get(0))?
                 .collect::<std::result::Result<_, _>>()?;
@@ -2178,7 +2182,11 @@ fn base_class_hop(
         .optional()?
         .flatten();
     let Some(b) = base else { return Ok(None) };
-    let mut cstmt = conn.prepare_cached("SELECT kind FROM symbols WHERE name=?1 AND lang=?2 LIMIT 2")?;
+    // same validation as the receiver hint: Java/C#/C++ constructors named like the class don't count
+    let mut cstmt = conn.prepare_cached(
+        "SELECT kind FROM symbols WHERE name=?1 AND lang=?2 \
+         AND NOT (?2 IN ('java','csharp','cpp') AND kind='function' AND parent_class=?1) LIMIT 2",
+    )?;
     let kinds: Vec<String> =
         cstmt.query_map(params![&b, lang], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
     if kinds.len() != 1 || kinds[0] != "class" {
@@ -4049,6 +4057,63 @@ mod tests {
         }
         assert_eq!(resolved(&s, "create", "r5"), ("exact".into(), Some("models.py".into())), "User.create");
         assert_eq!(edge_kinds(&s, "norm", "r6").0, "unresolved", "numpy.linalg is external");
+    }
+
+    /// `this.m()` names its receiver as syntactically as Rust's `self.m()`: the enclosing class is
+    /// the hint (TS/JS/Java/C#/C++, incl. C++ out-of-line `P1::go2`). JS arrows keep `this`; a
+    /// nested JS `function () {}` rebinds it, so no hint there. A constructor sharing the class's
+    /// name (Java/C#/C++) doesn't make the hint ambiguous, and an inherited method resolves one hop
+    /// up the class's first base.
+    #[test]
+    fn this_call_hints_the_enclosing_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("a.ts"),
+            "class A { render() {} go() { this.render(); } }\nclass B { render() {} }\n\
+             class K extends A { kgo() { this.render(); } }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b.js"),
+            "class A2 { draw() {} go() { [1].map(() => this.draw()); const f = function () { this.draw(); }; } }\n\
+             class B2 { draw() {} }\n",
+        )
+        .unwrap();
+        fs::write(root.join("J.java"), "class J1 { J1() {} void run() {} void go() { this.run(); } }\nclass J2 { void run() {} }\n\
+             class J3 extends J1 { void jgo() { this.run(); } }\n").unwrap();
+        fs::write(root.join("C.cs"), "class C1 { C1() {} void Tick() {} void Go() { this.Tick(); } }\nclass C2 { void Tick() {} }\n\
+             class C3 : C1 { void CGo() { this.Tick(); } }\n").unwrap();
+        fs::write(
+            root.join("p.cpp"),
+            "struct P1 { P1() {} void step() {} void go() { this->step(); } };\nstruct P2 { void step() {} };\n\
+             void P1::go2() { this->step(); }\nstruct P3 : public P1 { void pgo() { this->step(); } };\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        let target = |callee: &str, encl: &str| -> (String, Option<String>) {
+            s.conn
+                .query_row(
+                    "SELECT e.kind, t.parent_class FROM edges e JOIN symbols c ON e.caller_symbol=c.id \
+                     LEFT JOIN symbols t ON e.callee_symbol=t.id WHERE e.callee_name=?1 AND c.name=?2",
+                    params![callee, encl],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(target("render", "go"), ("exact".into(), Some("A".into())), "ts");
+        assert_eq!(target("draw", "go"), ("exact".into(), Some("A2".into())), "js arrow keeps this");
+        assert_eq!(target("draw", "f").0, "ambiguous", "js function() rebinds this");
+        assert_eq!(target("run", "go"), ("exact".into(), Some("J1".into())), "java");
+        assert_eq!(target("Tick", "Go"), ("exact".into(), Some("C1".into())), "c#");
+        assert_eq!(target("step", "go"), ("exact".into(), Some("P1".into())), "c++ in-class");
+        assert_eq!(target("step", "go2"), ("exact".into(), Some("P1".into())), "c++ out-of-line");
+        // one hop up the recorded base class (T4) when the class doesn't define it itself
+        assert_eq!(target("render", "kgo"), ("exact".into(), Some("A".into())), "ts extends");
+        assert_eq!(target("run", "jgo"), ("exact".into(), Some("J1".into())), "java extends");
+        assert_eq!(target("Tick", "CGo"), ("exact".into(), Some("C1".into())), "c# base list");
+        assert_eq!(target("step", "pgo"), ("exact".into(), Some("P1".into())), "c++ base clause");
     }
 
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind

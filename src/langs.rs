@@ -105,6 +105,49 @@ pub(crate) fn walk_children<F: FnMut(Node)>(node: Node, mut f: F) {
     }
 }
 
+/// A class's FIRST base type as a plain name (last segment of a qualified/generic/member form):
+/// `extends a.B<T>` -> B, `: public ns::Base` -> Base. Recorded as `base_class` so a `this.m()`
+/// the class doesn't define itself resolves one hop up (T4). Anything fancier -> None.
+fn first_base_name(class_node: Node, src: &[u8]) -> Option<String> {
+    fn type_name(n: Node, src: &[u8]) -> Option<String> {
+        match n.kind() {
+            "identifier" | "type_identifier" => Some(text(n, src).to_string()),
+            "member_expression" => n.child_by_field_name("property").map(|p| text(p, src).to_string()),
+            "qualified_identifier" | "qualified_name" | "scoped_type_identifier" | "generic_name" | "template_type"
+            | "generic_type" => n
+                .child_by_field_name("name")
+                .or_else(|| {
+                    let mut c = n.walk();
+                    let kids: Vec<Node> = n.named_children(&mut c).collect();
+                    // scoped: last segment; generic: the base name comes first
+                    if n.kind().starts_with("generic") { kids.first().copied() } else { kids.last().copied() }
+                })
+                .and_then(|x| type_name(x, src)),
+            _ => None,
+        }
+    }
+    let base = if let Some(sc) = class_node.child_by_field_name("superclass") {
+        sc.named_child(0) // java: `extends T`
+    } else if let Some(h) = find_child(class_node, "class_heritage") {
+        match find_child(h, "extends_clause") {
+            Some(e) => e.child_by_field_name("value"), // ts
+            None => h.named_child(0),                  // js
+        }
+    } else if let Some(b) = find_child(class_node, "base_list").or_else(|| find_child(class_node, "base_class_clause")) {
+        let mut c = b.walk();
+        let first = b.named_children(&mut c).find(|k| !matches!(k.kind(), "access_specifier" | "attribute_declaration" | "argument_list"));
+        first // c# / c++
+    } else {
+        None
+    };
+    base.and_then(|b| type_name(b, src))
+}
+
+/// `this.m()` / `this->m()`: the receiver object is `this` -> the enclosing class, if known.
+fn this_hint(obj: Option<Node>, ctx: CppCtx) -> Option<String> {
+    obj.filter(|o| o.kind() == "this").and(ctx.this_class).map(str::to_string)
+}
+
 pub(crate) fn find_child<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
     let mut found = None;
@@ -368,7 +411,7 @@ fn walk_c<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, enclosing: &'a st
 pub fn parse_cpp(src: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, tree_sitter_cpp::LANGUAGE.into(), "cpp")?;
     let mut out = ParsedFile::default();
-    walk_cpp(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None });
+    walk_cpp(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
     Ok(out)
 }
 
@@ -376,6 +419,9 @@ pub fn parse_cpp(src: &str) -> anyhow::Result<ParsedFile> {
 struct CppCtx<'a> {
     enclosing: &'a str,
     container: Option<&'a str>, // enclosing class/struct body
+    /// what `this` names here: the class whose method (or field initializer) encloses this code.
+    /// Syntactically free like Rust's `self`; JS `function` expressions rebind it (-> None).
+    this_class: Option<&'a str>,
 }
 
 fn walk_cpp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>) {
@@ -386,7 +432,8 @@ fn walk_cpp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>
             if let (Some(name), Some(_body)) = (node.child_by_field_name("name"), node.child_by_field_name("body")) {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "class", ctx.container, node, src, None));
-                child_ctx = CppCtx { container: Some(nm), ..ctx };
+                out.defs.last_mut().expect("just pushed").base_class = first_base_name(node, src);
+                child_ctx = CppCtx { container: Some(nm), this_class: Some(nm), ..ctx };
             }
         }
         "function_definition" => {
@@ -408,7 +455,7 @@ fn walk_cpp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>
                 };
                 if !nm.is_empty() {
                     out.defs.push(mk_def(nm, "function", parent, node, src, None));
-                    child_ctx = CppCtx { enclosing: nm, container: None };
+                    child_ctx = CppCtx { enclosing: nm, container: None, this_class: parent };
                 }
             }
         }
@@ -418,7 +465,8 @@ fn walk_cpp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>
                     "identifier" => push_call(out, text(f, src), "func", node, ctx.enclosing, None),
                     "field_expression" => {
                         if let Some(field) = f.child_by_field_name("field") {
-                            push_call(out, text(field, src), "method", node, ctx.enclosing, None);
+                            let recv = this_hint(f.child_by_field_name("argument"), ctx);
+                            push_call(out, text(field, src), "method", node, ctx.enclosing, recv);
                         }
                     }
                     // `X::y()` — member name only, no hint; C++ is allowed to over-report
@@ -443,7 +491,7 @@ fn walk_cpp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>
 pub fn parse_csharp(src: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, tree_sitter_c_sharp::LANGUAGE.into(), "c-sharp")?;
     let mut out = ParsedFile::default();
-    walk_csharp(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None });
+    walk_csharp(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
     Ok(out)
 }
 
@@ -454,21 +502,22 @@ fn walk_csharp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<
             if let Some(name) = node.child_by_field_name("name") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "class", ctx.container, node, src, leading_doc(node, src)));
-                child_ctx = CppCtx { container: Some(nm), ..ctx };
+                out.defs.last_mut().expect("just pushed").base_class = first_base_name(node, src);
+                child_ctx = CppCtx { container: Some(nm), this_class: Some(nm), ..ctx };
             }
         }
         "method_declaration" | "constructor_declaration" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "function", ctx.container, node, src, leading_doc(node, src)));
-                child_ctx = CppCtx { enclosing: nm, container: None };
+                child_ctx = CppCtx { enclosing: nm, container: None, this_class: ctx.container };
             }
         }
         "local_function_statement" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "function", None, node, src, None));
-                child_ctx = CppCtx { enclosing: nm, container: None };
+                child_ctx = CppCtx { enclosing: nm, container: None, ..ctx };
             }
         }
         "invocation_expression" => {
@@ -477,7 +526,8 @@ fn walk_csharp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<
                     "identifier" => push_call(out, text(f, src), "func", node, ctx.enclosing, None),
                     "member_access_expression" => {
                         if let Some(name) = f.child_by_field_name("name") {
-                            push_call(out, text(name, src), "method", node, ctx.enclosing, None);
+                            let recv = this_hint(f.child_by_field_name("expression"), ctx);
+                            push_call(out, text(name, src), "method", node, ctx.enclosing, recv);
                         }
                     }
                     _ => {}
@@ -513,7 +563,7 @@ fn walk_csharp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<
 pub fn parse_java(src: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, tree_sitter_java::LANGUAGE.into(), "java")?;
     let mut out = ParsedFile::default();
-    walk_java(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None });
+    walk_java(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
     Ok(out)
 }
 
@@ -524,21 +574,23 @@ fn walk_java<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a
             if let Some(name) = node.child_by_field_name("name") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "class", ctx.container, node, src, leading_doc(node, src)));
-                child_ctx = CppCtx { container: Some(nm), ..ctx };
+                out.defs.last_mut().expect("just pushed").base_class = first_base_name(node, src);
+                child_ctx = CppCtx { container: Some(nm), this_class: Some(nm), ..ctx };
             }
         }
         "method_declaration" | "constructor_declaration" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "function", ctx.container, node, src, leading_doc(node, src)));
-                child_ctx = CppCtx { enclosing: nm, container: None };
+                child_ctx = CppCtx { enclosing: nm, container: None, this_class: ctx.container };
             }
         }
         "method_invocation" => {
             if let Some(name) = node.child_by_field_name("name") {
-                // `x.foo()` -> method; bare `foo()` -> func (universal split, no hints)
-                let kind = if node.child_by_field_name("object").is_some() { "method" } else { "func" };
-                push_call(out, text(name, src), kind, node, ctx.enclosing, None);
+                // `x.foo()` -> method; bare `foo()` -> func; `this.foo()` -> enclosing class hint
+                let obj = node.child_by_field_name("object");
+                let kind = if obj.is_some() { "method" } else { "func" };
+                push_call(out, text(name, src), kind, node, ctx.enclosing, this_hint(obj, ctx));
             }
         }
         "import_declaration" => {
@@ -578,7 +630,7 @@ pub fn parse_tsx(src: &str) -> anyhow::Result<ParsedFile> {
 fn parse_js_family(src: &str, language: Language, what: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, language, what)?;
     let mut out = ParsedFile::default();
-    walk_js(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None });
+    walk_js(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
     Ok(out)
 }
 
@@ -589,21 +641,22 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
             if let Some(name) = node.child_by_field_name("name") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "function", None, node, src, leading_doc(node, src)));
-                child_ctx = CppCtx { enclosing: nm, container: None };
+                child_ctx = CppCtx { enclosing: nm, container: None, this_class: None };
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "class", ctx.container, node, src, leading_doc(node, src)));
-                child_ctx = CppCtx { container: Some(nm), ..ctx };
+                out.defs.last_mut().expect("just pushed").base_class = first_base_name(node, src);
+                child_ctx = CppCtx { container: Some(nm), this_class: Some(nm), ..ctx };
             }
         }
         "method_definition" => {
             if let Some(name) = node.child_by_field_name("name").filter(|n| n.kind() == "property_identifier") {
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "function", ctx.container, node, src, leading_doc(node, src)));
-                child_ctx = CppCtx { enclosing: nm, container: None };
+                child_ctx = CppCtx { enclosing: nm, container: None, this_class: ctx.container };
             }
         }
         // `const x = () => ..` / `const x = function ..` — cheap and very common (spec L1.3)
@@ -614,9 +667,13 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
                 {
                     let nm = text(name, src);
                     out.defs.push(mk_def(nm, "function", None, node, src, None));
-                    child_ctx = CppCtx { enclosing: nm, container: None };
+                    child_ctx = CppCtx { enclosing: nm, container: None, ..ctx };
                 }
             }
+        }
+        // an anonymous `function () {}` / generator gets its own `this`
+        "function_expression" | "function" | "generator_function" => {
+            child_ctx = CppCtx { this_class: None, ..ctx };
         }
         "call_expression" => {
             if let Some(f) = node.child_by_field_name("function") {
@@ -624,7 +681,8 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
                     "identifier" => push_call(out, text(f, src), "func", node, ctx.enclosing, None),
                     "member_expression" => {
                         if let Some(prop) = f.child_by_field_name("property").filter(|p| p.kind() == "property_identifier") {
-                            push_call(out, text(prop, src), "method", node, ctx.enclosing, None);
+                            let recv = this_hint(f.child_by_field_name("object"), ctx);
+                            push_call(out, text(prop, src), "method", node, ctx.enclosing, recv);
                         }
                     }
                     _ => {}
