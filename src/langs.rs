@@ -723,6 +723,11 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
         "function_expression" | "function" | "generator_function" => {
             child_ctx = CppCtx { this_class: None, ..ctx };
         }
+        // an object literal's methods belong to (and `this` is) the object, not an enclosing class
+        // — e.g. `class F { handlers = { h() { this.x() } } }`
+        "object" => {
+            child_ctx = CppCtx { container: None, this_class: None, ..ctx };
+        }
         "call_expression" => {
             if let Some(f) = node.child_by_field_name("function") {
                 match f.kind() {

@@ -4084,7 +4084,8 @@ mod tests {
         fs::write(
             root.join("a.ts"),
             "class A { render() {} go() { this.render(); } }\nclass B { render() {} }\n\
-             class K extends A { kgo() { this.render(); } }\n",
+             class K extends A { kgo() { this.render(); } }\n\
+             class F { handlers = { helper() { return this.render(); } }; render() {} }\n",
         )
         .unwrap();
         fs::write(
@@ -4116,6 +4117,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(target("render", "go"), ("exact".into(), Some("A".into())), "ts");
+        assert_eq!(target("render", "helper").0, "ambiguous", "object-literal method: `this` is the object");
         assert_eq!(target("draw", "go"), ("exact".into(), Some("A2".into())), "js arrow keeps this");
         assert_eq!(target("draw", "f").0, "ambiguous", "js function() rebinds this");
         assert_eq!(target("run", "go"), ("exact".into(), Some("J1".into())), "java");
