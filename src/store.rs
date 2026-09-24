@@ -1921,6 +1921,9 @@ fn resolve_call(
                 if cands.len() > 1 && lang == "python" && is_external_receiver(conn, rc, call_site_file)? {
                     return Ok((None, "unresolved"));
                 }
+                if cands.len() > 1 && lang == "rust" && rust_receiver_is_external(conn, rc, &cands)? {
+                    return Ok((None, "unresolved"));
+                }
             } else if hint_names_a_class(&kinds, lang) && !rust_hint_may_be_trait(conn, rc, lang)? {
                 let filt: Vec<&(i64, Option<String>, String)> =
                     cands.iter().filter(|(_, pc, _)| pc.as_deref() == Some(rc)).collect();
@@ -2009,12 +2012,16 @@ fn rust_hint_may_be_trait(conn: &Connection, rc: &str, lang: &str) -> Result<boo
         .query_row([rc], |r| r.get(0))
         .optional()?
         .flatten();
-    Ok(!sig.is_some_and(|s| {
-        matches!(
-            s.split_whitespace().find(|t| matches!(*t, "struct" | "enum" | "union" | "trait")),
-            Some("struct" | "enum" | "union")
-        )
-    }))
+    Ok(!sig.as_deref().is_some_and(rust_sig_is_concrete))
+}
+
+/// A stored Rust first line positively shows struct/enum/union (keywords, so the first one there
+/// is the item's own); a trait, or a header split before its keyword, doesn't.
+fn rust_sig_is_concrete(sig: &str) -> bool {
+    matches!(
+        sig.split_whitespace().find(|t| matches!(*t, "struct" | "enum" | "union" | "trait")),
+        Some("struct" | "enum" | "union")
+    )
 }
 
 /// T4 — single-hop inheritance: `rc` (already validated as a class with no own method `name`)
@@ -2042,6 +2049,42 @@ fn base_class_hop(
     let filt: Vec<&(i64, Option<String>, String)> =
         cands.iter().filter(|(_, pc, _)| pc.as_deref() == Some(b.as_str())).collect();
     Ok((filt.len() == 1).then(|| (Some(filt[0].0), "exact")))
+}
+
+/// Rust W2.1: std CONCRETE types only. Never traits: `Default::default()` / `FromStr::from_str(s)`
+/// can dispatch into in-repo impls, `Vec::new()` can't. Third-party types (`Regex`, `Map`) aren't
+/// provable from the stored `use` text alone, so they stay ambiguous.
+const RUST_STD_TYPES: &[&str] = &[
+    "Vec", "String", "Box", "Option", "Result", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "VecDeque",
+    "BinaryHeap", "Arc", "Rc", "Weak", "Mutex", "RwLock", "Cell", "RefCell", "OnceCell", "OnceLock", "Path",
+    "PathBuf", "OsStr", "OsString", "Duration", "Instant", "SystemTime", "File",
+];
+
+/// Rust W2.1: `rc` (zero in-repo symbols, checked by the caller) is a std type, so its own methods
+/// live outside the repo. In-repo code is still reachable two ways, and either keeps the call
+/// ambiguous: the repo defines the method on that type (`impl Tr for Vec<..> { fn m }` ->
+/// parent_class = rc), or an in-repo trait default reached through `impl Tr for Vec<..> {}` (the
+/// parent is then an in-repo def that isn't provably struct/enum/union). A parent with no in-repo
+/// def is another external type's impl (`impl Tr for String`), unreachable from `Vec::`.
+fn rust_receiver_is_external(conn: &Connection, rc: &str, cands: &[(i64, Option<String>, String)]) -> Result<bool> {
+    if !RUST_STD_TYPES.contains(&rc) {
+        return Ok(false);
+    }
+    let mut sig_stmt =
+        conn.prepare_cached("SELECT signature FROM symbols WHERE name=?1 AND lang='rust' AND kind='class' LIMIT 1")?;
+    for (_, pc, _) in cands {
+        let Some(p) = pc.as_deref() else { continue };
+        if p == rc {
+            return Ok(false);
+        }
+        let sig: Option<Option<String>> = sig_stmt.query_row([p], |r| r.get(0)).optional()?;
+        if let Some(sig) = sig {
+            if !sig.as_deref().is_some_and(rust_sig_is_concrete) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// W2.1: conservative Python builtin types — a receiver hint naming one of these, with zero
@@ -3737,6 +3780,30 @@ mod tests {
         assert_eq!(edge_kinds(&s, "bye", "hi").0, "ambiguous", "B overrides bye -> not the default");
         assert_eq!(edge_kinds(&s, "only", "hi2").0, "exact", "unique name still exact");
         assert_eq!(edge_kinds(&s, "run", "go").0, "ambiguous", "`trait` off line 1 still never narrows");
+    }
+
+    /// Rust W2.1: `Vec::new()` when no in-repo symbol is named `Vec` can't reach any in-repo `new`
+    /// -> unresolved (external), not ambiguous noise. Unless the repo itself gives the external type
+    /// that method (an `impl .. for String` def) or an in-repo trait default could be reached through
+    /// it (`impl Tagged for Box<..> {}`) — then it stays ambiguous.
+    #[test]
+    fn rust_call_on_external_type_is_unresolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub struct A;\npub struct B;\nimpl A { fn new() -> Self { A } fn tag(&self) -> i32 { 1 } }\n\
+             impl B { fn new() -> Self { B } }\n\
+             pub trait Mk { fn new() -> Self; }\nimpl Mk for String { fn new() -> Self { String::default() } }\n\
+             pub trait Tagged { fn tag(&self) -> i32 { 0 } }\nimpl Tagged for Box<i32> {}\n\
+             fn ext() { Vec::new(); }\nfn own() { String::new(); }\nfn dflt() { Box::tag(&Box::new(1)); }\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(edge_kinds(&s, "new", "ext").0, "unresolved", "Vec::new -> std");
+        assert_eq!(edge_kinds(&s, "new", "own").0, "ambiguous", "repo impls new for String");
+        assert_eq!(edge_kinds(&s, "tag", "dflt").0, "ambiguous", "Tagged default reachable via Box");
     }
 
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind
