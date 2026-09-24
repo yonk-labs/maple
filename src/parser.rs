@@ -215,6 +215,11 @@ struct WalkState<'o> {
     var_receivers: &'o mut Vec<(usize, String)>,
     attr_bindings: &'o mut Vec<AttrBinding>,
     attr_receivers: &'o mut Vec<(usize, String, String)>,
+    /// import-bound names -> dotted module path: `import a.b` binds `a` -> "a", `import a.b as m`
+    /// binds m -> "a.b", `from p import x` binds x -> "p.x" (a submodule, or a name defined in p)
+    module_bindings: &'o mut Vec<(String, String)>,
+    /// (call index, dotted receiver) for `a.b.f()` — a pure identifier chain not rooted at self
+    chain_receivers: &'o mut Vec<(usize, String)>,
 }
 
 pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
@@ -232,12 +237,16 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
     let mut attr_bindings: Vec<AttrBinding> = Vec::new();
     // (call index, enclosing self_class, attr name) for `self.attr.foo()` sites
     let mut attr_receivers: Vec<(usize, String, String)> = Vec::new();
+    let mut module_bindings: Vec<(String, String)> = Vec::new();
+    let mut chain_receivers: Vec<(usize, String)> = Vec::new();
     let mut state = WalkState {
         out: &mut out,
         bindings: &mut bindings,
         var_receivers: &mut var_receivers,
         attr_bindings: &mut attr_bindings,
         attr_receivers: &mut attr_receivers,
+        module_bindings: &mut module_bindings,
+        chain_receivers: &mut chain_receivers,
     };
     walk(
         tree.root_node(),
@@ -271,7 +280,15 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
         classes.dedup();
         if classes.len() == 1 {
             out.calls[idx].receiver_class = Some(classes[0].to_string());
-        } // >1 distinct bindings or none -> no hint (never guess)
+        } else if classes.is_empty() {
+            // not a local instance: an import-bound module name? (`json.load()`, `h.helper()`)
+            out.calls[idx].receiver_class = module_path(&module_bindings, &var, "").map(|p| format!("mod:{p}"));
+        } // >1 distinct bindings -> no hint (never guess)
+    }
+    // `a.b.f()`: the chain's root is an import-bound module name -> its dotted path + the rest
+    for (idx, chain) in chain_receivers {
+        let (root, rest) = chain.split_once('.').unwrap_or((chain.as_str(), ""));
+        out.calls[idx].receiver_class = module_path(&module_bindings, root, rest).map(|p| format!("mod:{p}"));
     }
 
     // T2 post-pass: `self.attr.foo()` where `attr` was bound to exactly ONE distinct class name
@@ -289,6 +306,24 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
         }
     }
     Ok(out)
+}
+
+/// The dotted module path `local` is bound to by this file's imports, with `rest` appended — only
+/// when every binding of `local` agrees (a name imported twice from different places is no hint).
+fn module_path(bindings: &[(String, String)], local: &str, rest: &str) -> Option<String> {
+    let mut paths = bindings.iter().filter(|(l, _)| l == local).map(|(_, p)| p.as_str());
+    let first = paths.next()?;
+    if paths.any(|p| p != first) {
+        return None;
+    }
+    Some(if rest.is_empty() { first.to_string() } else { format!("{first}.{rest}") })
+}
+
+fn is_py_ident_chain(t: &str) -> bool {
+    t.split('.').all(|seg| {
+        let mut ch = seg.chars();
+        ch.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && ch.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 pub(crate) fn text<'a>(n: Node, src: &'a [u8]) -> &'a str {
@@ -589,6 +624,7 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
                             let mut receiver_class: Option<String> = None;
                             let mut var: Option<String> = None;
                             let mut attr_recv: Option<(String, String)> = None;
+                            let mut chain: Option<String> = None;
                             if let Some(o) = obj {
                                 match o.kind() {
                                     "identifier" => {
@@ -617,6 +653,10 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
                                                 }
                                             }
                                         }
+                                        let t = text(o, src);
+                                        if !t.starts_with("self.") && is_py_ident_chain(t) {
+                                            chain = Some(t.to_string());
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -633,6 +673,9 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
                             }
                             if let Some((cn, at)) = attr_recv {
                                 state.attr_receivers.push((state.out.calls.len() - 1, cn, at));
+                            }
+                            if let Some(c) = chain {
+                                state.chain_receivers.push((state.out.calls.len() - 1, c));
                             }
                         }
                     }
@@ -651,7 +694,24 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
         "import_statement" => {
             state.out.imports.push(Import { raw: first_line(node, src), line: node.start_position().row + 1 });
             // module imports (`import a.b`) are out of scope for T3 (module-attribute calls are
-            // "method" kind) -> no import_names emitted here.
+            // "method" kind) -> no import_names emitted here; they bind module receivers instead.
+            let mut nc = node.walk();
+            for name_node in node.children_by_field_name("name", &mut nc) {
+                match name_node.kind() {
+                    "dotted_name" => {
+                        let root = text(name_node, src).split('.').next().unwrap_or("").to_string();
+                        state.module_bindings.push((root.clone(), root));
+                    }
+                    "aliased_import" => {
+                        if let (Some(n), Some(a)) =
+                            (name_node.child_by_field_name("name"), name_node.child_by_field_name("alias"))
+                        {
+                            state.module_bindings.push((text(a, src).to_string(), text(n, src).to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         "import_from_statement" => {
             state.out.imports.push(Import { raw: first_line(node, src), line: node.start_position().row + 1 });
@@ -665,16 +725,26 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
                         let mut nc = node.walk();
                         for name_node in node.children_by_field_name("name", &mut nc) {
                             match name_node.kind() {
-                                "dotted_name" => state.out.import_names.push(ImportName {
-                                    local: text(name_node, src).to_string(),
-                                    source_module: module.clone(),
-                                }),
+                                "dotted_name" => {
+                                    let n = text(name_node, src);
+                                    state.out.import_names.push(ImportName {
+                                        local: n.to_string(),
+                                        source_module: module.clone(),
+                                    });
+                                    state.module_bindings.push((n.to_string(), format!("{module}.{n}")));
+                                }
                                 "aliased_import" => {
                                     if let Some(alias) = name_node.child_by_field_name("alias") {
                                         state.out.import_names.push(ImportName {
                                             local: text(alias, src).to_string(),
                                             source_module: module.clone(),
                                         });
+                                        if let Some(n) = name_node.child_by_field_name("name") {
+                                            state.module_bindings.push((
+                                                text(alias, src).to_string(),
+                                                format!("{module}.{}", text(n, src)),
+                                            ));
+                                        }
                                     }
                                 }
                                 _ => {}

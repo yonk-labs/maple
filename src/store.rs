@@ -1904,6 +1904,12 @@ fn resolve_call(
 
     if call_kind == "method" {
         if let Some(rc) = receiver_class {
+            // Python `m.f()` with `m` import-bound (parser hint `mod:<dotted path>`)
+            if let Some(path) = rc.strip_prefix("mod:") {
+                if let Some(hit) = resolve_module_attr(conn, path, &cands)? {
+                    return Ok(hit);
+                }
+            }
             // hint is trusted only if `rc` names exactly one same-language symbol and it's a class
             let mut cstmt = conn.prepare_cached("SELECT kind FROM symbols WHERE name=?1 AND lang=?2 LIMIT 2")?;
             let kinds: Vec<String> = cstmt
@@ -2050,6 +2056,68 @@ fn is_std_method_name(lang: &str, name: &str) -> bool {
         _ => &[],
     };
     list.contains(&name)
+}
+
+/// Python `m.f()` where `m` is import-bound to the dotted module `path`. Walks up the path:
+/// - the module itself has an in-repo file -> its module-level defs among `cands`;
+/// - `from pkg import Cls` and pkg's file defines class `Cls` -> Cls's methods;
+/// - some other prefix is in the repo (a package that re-exports or builds it) -> None: the
+///   caller's universal answer stands, never a guess;
+/// - no prefix is in the repo -> the module is external -> unresolved.
+///
+/// ponytail: module files match by path suffix (as T3a does), so a top-level `json.py` anywhere in
+/// the repo shadows stdlib `json`; source-root detection is the upgrade if that bites.
+fn resolve_module_attr(
+    conn: &Connection,
+    path: &str,
+    cands: &[(i64, Option<String>, String)],
+) -> Result<Option<(Option<i64>, &'static str)>> {
+    let pick = |hits: Vec<&(i64, Option<String>, String)>| -> Option<(Option<i64>, &'static str)> {
+        match hits.len() {
+            0 => None, // module has no such def (re-export / dynamic) -> fall back
+            1 => Some((Some(hits[0].0), "exact")),
+            // same file re-def: last one (parse order) wins, as T3(b); across files: ambiguous
+            _ if hits.iter().all(|h| h.2 == hits[0].2) => hits.iter().max_by_key(|h| h.0).map(|h| (Some(h.0), "exact")),
+            _ => Some((None, "ambiguous")),
+        }
+    };
+    let mut prefix = path;
+    loop {
+        let files = python_module_files(conn, prefix)?;
+        if !files.is_empty() {
+            if prefix == path {
+                return Ok(pick(cands.iter().filter(|(_, pc, f)| pc.is_none() && files.contains(f)).collect()));
+            }
+            let rest = &path[prefix.len() + 1..];
+            if !rest.contains('.') {
+                let is_class: bool = conn
+                    .prepare_cached("SELECT file FROM symbols WHERE name=?1 AND kind='class' AND lang='python'")?
+                    .query_map([rest], |r| r.get::<_, String>(0))?
+                    .filter_map(|f| f.ok())
+                    .any(|f| files.contains(&f));
+                if is_class {
+                    return Ok(pick(
+                        cands.iter().filter(|(_, pc, f)| pc.as_deref() == Some(rest) && files.contains(f)).collect(),
+                    ));
+                }
+            }
+            return Ok(None);
+        }
+        match prefix.rsplit_once('.') {
+            Some((p, _)) => prefix = p,
+            None => return Ok(Some((None, "unresolved"))),
+        }
+    }
+}
+
+/// In-repo files for dotted Python module `m`: `a/b.py` or `a/b/__init__.py`, by path suffix.
+fn python_module_files(conn: &Connection, m: &str) -> Result<Vec<String>> {
+    let base = m.replace('.', "/");
+    let mut stmt = conn.prepare_cached(
+        "SELECT path FROM files WHERE lang='python' AND (path IN (?1,?2) OR path LIKE '%/' || ?1 OR path LIKE '%/' || ?2)",
+    )?;
+    let rows = stmt.query_map(params![format!("{base}.py"), format!("{base}/__init__.py")], |r| r.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// Receiver-hint validation: the hint is trusted only when `rc` names class-kind symbols.
@@ -3947,6 +4015,40 @@ mod tests {
         assert_eq!(edge_kinds(&s, "print", "main").0, "unresolved", "not imported, not defined here -> builtin");
         assert_eq!(edge_kinds(&s, "print", "m").0, "exact", "explicitly imported from util");
         assert_eq!(edge_kinds(&s, "print", "here").0, "exact", "defined in this file");
+    }
+
+    /// Python `m.f()` where `m` is import-bound in the calling file: an in-repo module narrows to
+    /// that file's module-level defs (or, for `from pkg import Cls`, to Cls's methods); a module
+    /// with no in-repo file at any prefix of its path is external -> unresolved.
+    #[test]
+    fn python_module_receiver_resolves_via_the_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("util")).unwrap();
+        fs::write(root.join("util/__init__.py"), "").unwrap();
+        fs::write(root.join("util/helpers.py"), "def helper():\n    pass\n").unwrap();
+        fs::write(root.join("other.py"), "def helper():\n    pass\n\ndef load(f):\n    pass\n\ndef norm(x):\n    pass\n").unwrap();
+        fs::write(
+            root.join("models.py"),
+            "class User:\n    def create(cls):\n        pass\n\nclass Team:\n    def create(self):\n        pass\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app.py"),
+            "import json\nimport util.helpers\nimport util.helpers as h\nfrom util import helpers\n\
+             from models import User\nimport numpy as np\n\n\
+             def r1(f):\n    json.load(f)\n\ndef r2():\n    util.helpers.helper()\n\ndef r3():\n    h.helper()\n\n\
+             def r4():\n    helpers.helper()\n\ndef r5():\n    User.create()\n\ndef r6(x):\n    np.linalg.norm(x)\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(edge_kinds(&s, "load", "r1").0, "unresolved", "json is external");
+        for encl in ["r2", "r3", "r4"] {
+            assert_eq!(resolved(&s, "helper", encl), ("exact".into(), Some("util/helpers.py".into())), "{encl}");
+        }
+        assert_eq!(resolved(&s, "create", "r5"), ("exact".into(), Some("models.py".into())), "User.create");
+        assert_eq!(edge_kinds(&s, "norm", "r6").0, "unresolved", "numpy.linalg is external");
     }
 
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind
