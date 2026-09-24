@@ -1968,6 +1968,11 @@ fn resolve_call(
         if let Some(last) = same_file.iter().max_by_key(|(id, _, _)| *id) {
             return Ok((Some(last.0), "exact"));
         }
+        // Python LEGB: not bound by an in-repo import (T3a) nor this file's module level (T3b), a
+        // builtin name IS the builtin — `print()` never reaches another module's `def print`.
+        if lang == "python" && PY_BUILTIN_NAMES.contains(&name) {
+            return Ok((None, "unresolved"));
+        }
         // T3(c): fall back to current behavior (all module-level, then full set)
         match mod_level.len() {
             1 => return Ok((Some(mod_level[0].0), "exact")),
@@ -1977,9 +1982,74 @@ fn resolve_call(
     }
 
     Ok(match cands.len() {
+        // A method call reaching here has no trusted receiver: its lone same-named def is a guess.
+        // When the name is a std/runtime method of the caller's language, the receiver is far
+        // likelier a std value (`s.clone()`, `", ".join(xs)`, `cur.execute(q)`) than the repo's one
+        // def, so it's ambiguous (in-repo def vs std), never a guessed exact.
+        1 if call_kind == "method" && is_std_method_name(lang, name) => (None, "ambiguous"),
         1 => (Some(cands[0].0), "exact"),
         _ => (None, "ambiguous"),
     })
+}
+
+/// Per-language std/runtime method names that commonly collide with a repo's own lone def
+/// (see the universal fallback in `resolve_call`). Same idea as PY_BUILTINS / RUST_STD_TYPES: a
+/// curated list, deliberately limited to names whose std use dwarfs project use.
+/// ponytail: curated lists miss unlisted collisions (a test lib's `vi.fn()`); an import/evidence
+/// gate on the lone candidate's owner is the upgrade if that bites.
+fn is_std_method_name(lang: &str, name: &str) -> bool {
+    let list: &[&str] = match lang {
+        "rust" => &[
+            "clone", "clone_from", "to_string", "to_owned", "into", "from", "as_ref", "as_mut", "as_str",
+            "as_bytes", "as_slice", "borrow", "borrow_mut", "deref", "fmt", "eq", "ne", "cmp", "partial_cmp",
+            "hash", "drop", "default", "len", "is_empty", "get", "get_mut", "insert", "remove", "contains",
+            "contains_key", "push", "push_str", "pop", "extend", "iter", "iter_mut", "into_iter", "map",
+            "map_err", "and_then", "filter", "find", "collect", "next", "unwrap", "expect", "unwrap_or",
+            "unwrap_or_default", "unwrap_or_else", "ok", "err", "ok_or", "join", "split", "trim", "first",
+            "last", "keys", "values", "entry", "lock", "send", "recv", "parse", "clear", "sort", "retain",
+            "take", "replace", "write", "read", "flush", "is_some", "is_none", "is_ok", "is_err",
+        ],
+        "python" => &[
+            "join", "format", "get", "items", "keys", "values", "append", "extend", "pop", "update", "add",
+            "remove", "discard", "split", "strip", "replace", "startswith", "endswith", "lower", "upper",
+            "encode", "decode", "read", "write", "close", "execute", "executemany", "commit", "rollback",
+            "fetchone", "fetchall", "fetchmany", "cursor", "copy", "sort", "count", "index", "setdefault",
+            "clear", "insert", "find", "group", "match", "search", "sub", "exists", "mkdir", "read_text",
+            "write_text", "is_file", "is_dir", "loads", "dumps", "mean", "sum",
+        ],
+        "javascript" | "typescript" => &[
+            "get", "set", "has", "delete", "clear", "push", "pop", "shift", "unshift", "slice", "splice",
+            "map", "filter", "reduce", "forEach", "find", "findIndex", "some", "every", "includes", "indexOf",
+            "join", "split", "trim", "replace", "toString", "then", "catch", "finally", "on", "off", "once",
+            "emit", "addEventListener", "removeEventListener", "max", "min", "floor", "ceil", "round", "abs",
+            "random", "resolve", "reject", "keys", "values", "entries", "assign", "parse", "stringify", "log",
+            "warn", "error", "info", "debug", "add", "sort", "concat", "test", "exec", "$", "querySelector",
+            "querySelectorAll", "getElementById", "appendChild", "getContext", "toFixed", "fn", "spyOn", "mock",
+        ],
+        "java" => &[
+            "get", "put", "add", "addAll", "remove", "contains", "containsKey", "size", "isEmpty", "equals",
+            "hashCode", "toString", "append", "length", "charAt", "substring", "stream", "map", "filter",
+            "collect", "forEach", "println", "close", "valueOf", "getClass", "iterator", "hasNext", "next",
+            "clear",
+        ],
+        "csharp" => &[
+            "TryGetValue", "ContainsKey", "Add", "Remove", "Contains", "Clear", "ToString", "Equals",
+            "GetHashCode", "ToList", "ToArray", "Where", "Select", "First", "FirstOrDefault", "Any", "All",
+            "Count", "Sum", "Max", "Min", "OrderBy", "GetComponent", "SetActive", "AddListener", "Log",
+            "Format", "Join", "Split", "Trim", "Replace", "Dispose", "Invoke",
+        ],
+        "go" => &[
+            "String", "Error", "Close", "Read", "Write", "Lock", "Unlock", "RLock", "RUnlock", "Len", "Get",
+            "Set", "Add", "Done", "Wait", "Printf", "Println", "Sprintf", "Errorf", "Fatal", "Fatalf",
+        ],
+        "cpp" => &[
+            "size", "empty", "push_back", "emplace_back", "pop_back", "begin", "end", "find", "insert",
+            "erase", "clear", "at", "front", "back", "c_str", "length", "substr", "min", "max", "swap", "reset",
+            "get", "count", "resize", "reserve", "data", "append", "str",
+        ],
+        _ => &[],
+    };
+    list.contains(&name)
 }
 
 /// Receiver-hint validation: the hint is trusted only when `rc` names class-kind symbols.
@@ -2086,6 +2156,31 @@ fn rust_receiver_is_external(conn: &Connection, rc: &str, cands: &[(i64, Option<
     }
     Ok(true)
 }
+
+/// Every public name in Python's `builtins` module (functions, types, exceptions), from
+/// `dir(builtins)` on CPython 3.13 minus constants and the site-added `exit`/`quit`/`help`/...
+/// Docs: https://docs.python.org/3/library/functions.html
+const PY_BUILTIN_NAMES: &[&str] = &[
+    "ArithmeticError", "AssertionError", "AttributeError", "BaseException", "BaseExceptionGroup",
+    "BlockingIOError", "BrokenPipeError", "BufferError", "BytesWarning", "ChildProcessError",
+    "ConnectionAbortedError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+    "DeprecationWarning", "EOFError", "EncodingWarning", "EnvironmentError", "Exception", "ExceptionGroup",
+    "FileExistsError", "FileNotFoundError", "FloatingPointError", "FutureWarning", "GeneratorExit", "IOError",
+    "ImportError", "ImportWarning", "IndentationError", "IndexError", "InterruptedError", "IsADirectoryError",
+    "KeyError", "KeyboardInterrupt", "LookupError", "MemoryError", "ModuleNotFoundError", "NameError",
+    "NotADirectoryError", "NotImplementedError", "OSError", "OverflowError", "PendingDeprecationWarning",
+    "PermissionError", "ProcessLookupError", "PythonFinalizationError", "RecursionError", "ReferenceError",
+    "ResourceWarning", "RuntimeError", "RuntimeWarning", "StopAsyncIteration", "StopIteration", "SyntaxError",
+    "SyntaxWarning", "SystemError", "SystemExit", "TabError", "TimeoutError", "TypeError", "UnboundLocalError",
+    "UnicodeDecodeError", "UnicodeEncodeError", "UnicodeError", "UnicodeTranslateError", "UnicodeWarning",
+    "UserWarning", "ValueError", "Warning", "ZeroDivisionError", "abs", "aiter", "all", "anext", "any", "ascii",
+    "bin", "bool", "breakpoint", "bytearray", "bytes", "callable", "chr", "classmethod", "compile", "complex",
+    "delattr", "dict", "dir", "divmod", "enumerate", "eval", "exec", "filter", "float", "format", "frozenset",
+    "getattr", "globals", "hasattr", "hash", "hex", "id", "input", "int", "isinstance", "issubclass", "iter",
+    "len", "list", "locals", "map", "max", "memoryview", "min", "next", "object", "oct", "open", "ord", "pow",
+    "print", "property", "range", "repr", "reversed", "round", "set", "setattr", "slice", "sorted",
+    "staticmethod", "str", "sum", "super", "tuple", "type", "vars", "zip",
+];
 
 /// W2.1: conservative Python builtin types — a receiver hint naming one of these, with zero
 /// in-repo symbols of the same name, is provably external.
@@ -3804,6 +3899,54 @@ mod tests {
         assert_eq!(edge_kinds(&s, "new", "ext").0, "unresolved", "Vec::new -> std");
         assert_eq!(edge_kinds(&s, "new", "own").0, "ambiguous", "repo impls new for String");
         assert_eq!(edge_kinds(&s, "tag", "dflt").0, "ambiguous", "Tagged default reachable via Box");
+    }
+
+    /// A lone in-repo candidate for a method call on an unproven receiver is exact only when the
+    /// name isn't a std/runtime method of the caller's language: `s.clone()` / `", ".join(xs)` far
+    /// more likely hit std than the repo's one `clone` / `join`. Project names stay exact, and so
+    /// does a std name bound by a trusted receiver hint (`self.len()` inside `impl IdMap`).
+    #[test]
+    fn lone_candidate_std_method_name_is_ambiguous_not_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub struct IdMap;\nimpl IdMap {\n    fn clone(&self) -> Self { IdMap }\n    fn len(&self) -> usize { 0 }\n\
+             \x20   fn size(&self) -> usize { self.len() }\n    fn shutdown(&self) {}\n}\n\
+             fn std_calls(s: String) { let t = s.clone(); t.len(); }\nfn own(m: &IdMap) { m.shutdown(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("db.py"),
+            "class Db:\n    def execute(self, q): pass\n    def join(self, xs): pass\n    def from_config(self): pass\n\n\
+             def run(conn, xs, d):\n    conn.execute('x')\n    ', '.join(xs)\n    d.from_config()\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(edge_kinds(&s, "clone", "std_calls").0, "ambiguous", "String::clone, not IdMap::clone");
+        assert_eq!(edge_kinds(&s, "len", "std_calls").0, "ambiguous");
+        assert_eq!(edge_kinds(&s, "shutdown", "own").0, "exact", "project name stays exact");
+        assert_eq!(edge_kinds(&s, "len", "size").0, "exact", "trusted self hint still binds a std name");
+        assert_eq!(edge_kinds(&s, "execute", "run").0, "ambiguous", "DB-API cursor.execute");
+        assert_eq!(edge_kinds(&s, "join", "run").0, "ambiguous", "str.join");
+        assert_eq!(edge_kinds(&s, "from_config", "run").0, "exact", "project name stays exact");
+    }
+
+    /// Python scoping (LEGB): a bare builtin name that the calling file neither imports nor defines
+    /// at module level IS the builtin, never some other module's same-named def.
+    #[test]
+    fn python_bare_builtin_call_resolves_to_the_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("util.py"), "def print(x):\n    pass\n\ndef here():\n    print('same file')\n").unwrap();
+        fs::write(root.join("app.py"), "def main():\n    print('hi')\n").unwrap();
+        fs::write(root.join("app2.py"), "from util import print\n\ndef m():\n    print('x')\n").unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(edge_kinds(&s, "print", "main").0, "unresolved", "not imported, not defined here -> builtin");
+        assert_eq!(edge_kinds(&s, "print", "m").0, "exact", "explicitly imported from util");
+        assert_eq!(edge_kinds(&s, "print", "here").0, "exact", "defined in this file");
     }
 
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind
