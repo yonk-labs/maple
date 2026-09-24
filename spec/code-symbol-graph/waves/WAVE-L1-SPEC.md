@@ -39,6 +39,9 @@ For each language extract:
 - **calls**: plain calls → kind `func`; member/selector/method calls → kind `method` with the member
   name. Receiver-class hints ONLY where free: Go method receiver in same type's methods (`s.foo()`
   where s is the receiver ident → receiver type), Rust `self.foo()` inside an `impl T` → T. Others: None.
+  *(Superseded for Rust in v0.3.9: `T::y()` / `m::T::y()` / `Self::y()` path calls → T — the type is
+  in the call, so still syntactically free — and a hint naming a trait never narrows. Post-0.3.9: a
+  std type hint with no in-repo reach (`Vec::new()`) → unresolved, Python W2.1's Rust twin.)*
 - **imports/aliases**: Rust `use a::b as c`; Go import aliases; Java imports (last segment); C# using;
   JS/TS `import {a as b} from`, default imports; C/C++ `#include` recorded as raw imports only (no
   alias semantics). Alias expansion feeds the existing resolution path unchanged.

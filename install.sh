@@ -31,11 +31,13 @@ esac
 echo
 echo "Runtime prerequisites:"
 if command -v git >/dev/null 2>&1; then
-  echo "  [ok]      git (used for git-aware delta indexing — maple falls back to a full"
-  echo "            content hash walk without it, so this isn't strictly required)"
+  echo "  [ok]      git (picks the files to index, honoring .gitignore, and powers delta"
+  echo "            indexing — without it maple walks and hashes everything, gitignored"
+  echo "            dirs included, so it isn't strictly required)"
 else
-  echo "  [MISSING] git (used for git-aware delta indexing — maple falls back to a full"
-  echo "            content hash walk without it, so this isn't strictly required)"
+  echo "  [MISSING] git (picks the files to index, honoring .gitignore, and powers delta"
+  echo "            indexing — without it maple walks and hashes everything, gitignored"
+  echo "            dirs included, so it isn't strictly required)"
 fi
 
 echo

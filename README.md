@@ -115,7 +115,8 @@ maple enumerate /path/to/your/repo --symbol your_function_name
 
 (Inside a git repo, maple indexes the files git would: gitignored paths and nested repos/worktrees
 are skipped, so a local `.venv-*` or a worktree under `.worktrees/` doesn't turn every def into a
-duplicate. Outside a git repo it walks the directory.)
+duplicate, and so are files `.gitattributes` marks `linguist-generated` / `linguist-vendored`. Outside a git repo, or when git lists no source files at all, it walks the directory —
+the latter says so on stderr, since .gitignore isn't applied then.)
 
 And assemble a task-ready bundle for it:
 
@@ -408,12 +409,16 @@ aliases, name-based resolution **scoped to the caller's language** (a `.rs` call
 `.java` def; cross-language calls like FFI are honest `unresolved`). Only Python additionally has
 the **exact resolver** — the type-aware layer that binds `self.foo()` / `x = C(); x.foo()` /
 annotated params / one-hop inheritance / import-aware bare calls deterministically. Receiver hints
-outside Python exist only where the syntax hands them over for free; nothing is inferred.
+outside Python exist only where the syntax hands them over for free; nothing is inferred. A method
+call with no trusted receiver binds `exact` to the repo's lone same-named def only when that name
+isn't a common std/runtime method of its language (`x.clone()`, `s.join(..)`, `cur.execute(..)` stay
+`ambiguous`), and a bare Python builtin (`print()`) not imported or defined in its file is the
+builtin (`unresolved`). See [DECISIONS.md](DECISIONS.md).
 
 | Language | Extensions | Defs + containers | func/method calls | Imports/aliases | Receiver hints | Docstrings |
 |---|---|---|---|---|---|---|
 | Python | `.py` | ✓ classes | ✓ | ✓ `import`/`from`/`as` | ✓ full exact resolver (S2/T1–T4) | ✓ |
-| Rust | `.rs` | ✓ struct/enum/trait + `impl` blocks | ✓ (`X::y` counts as method) | ✓ `use`, `use .. as` | `self.foo()` in `impl T` → T | ✓ `///` |
+| Rust | `.rs` | ✓ struct/enum/trait + `impl` blocks | ✓ (`X::y` counts as method) | ✓ `use`, `use .. as` | `self.foo()` in `impl T` → T; `T::y()` / `m::T::y()` / `Self::y()` → T. A trait never narrows (`Trait::m(&x)` stays ambiguous); a std type (`Vec::new()`) → unresolved | ✓ `///` |
 | C | `.c` `.h` | ✓ (no classes) | all `func` (C has no methods) | `#include` raw only | — | — |
 | C++ | `.cpp` `.cc` `.hpp` `.hh` | ✓ class/struct + out-of-line `X::y` defs | ✓ | `#include` raw only | — | — |
 | C# | `.cs` | ✓ class/interface/struct/record | ✓ | ✓ `using`, `using X = Y` | — | ✓ `///` / `/** */` |
