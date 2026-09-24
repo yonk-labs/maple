@@ -267,6 +267,11 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
         }
     }
 
+    // a name the file also binds locally (param, assignment, loop/with/except target, def) is not
+    // reliably the module: scope-blind on purpose, any such binding drops the module hint file-wide
+    let rebound = py_rebound_names(tree.root_node(), source.as_bytes());
+    module_bindings.retain(|(local, _)| !rebound.contains(local));
+
     // post-pass: `x.foo()` where x was bound to exactly ONE distinct class name in the same fn
     // (ctor assignment, a type-annotated parameter, or a same-file return type — same binding pool)
     for (idx, var) in var_receivers {
@@ -317,6 +322,61 @@ fn module_path(bindings: &[(String, String)], local: &str, rest: &str) -> Option
         return None;
     }
     Some(if rest.is_empty() { first.to_string() } else { format!("{first}.{rest}") })
+}
+
+/// Every name this file binds OTHER than by import: parameters (incl. lambda), assignment /
+/// augmented-assignment / for / comprehension targets, walrus names, with/except `as` targets,
+/// def and class names. Attribute and subscript targets (`m.x = 1`) don't rebind `m`.
+fn py_rebound_names(root: Node, src: &[u8]) -> std::collections::HashSet<String> {
+    fn targets(n: Node, src: &[u8], out: &mut std::collections::HashSet<String>) {
+        match n.kind() {
+            "identifier" => {
+                out.insert(text(n, src).to_string());
+            }
+            "attribute" | "subscript" => {}
+            _ => {
+                let mut c = n.walk();
+                for k in n.named_children(&mut c) {
+                    targets(k, src, out);
+                }
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "parameters" | "lambda_parameters" => {
+                let mut c = n.walk();
+                for p in n.named_children(&mut c) {
+                    // only the parameter's own name, never its annotation or default value
+                    let name = match p.kind() {
+                        "default_parameter" | "typed_default_parameter" => p.child_by_field_name("name"),
+                        "typed_parameter" => p.named_child(0),
+                        _ => Some(p),
+                    };
+                    if let Some(nm) = name {
+                        targets(nm, src, &mut out);
+                    }
+                }
+            }
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                if let Some(l) = n.child_by_field_name("left") {
+                    targets(l, src, &mut out);
+                }
+            }
+            "named_expression" | "function_definition" | "class_definition" => {
+                if let Some(nm) = n.child_by_field_name("name") {
+                    out.insert(text(nm, src).to_string());
+                }
+            }
+            "as_pattern_target" => targets(n, src, &mut out),
+            _ => {}
+        }
+        let mut c = n.walk();
+        stack.extend(n.named_children(&mut c));
+    }
+    out
 }
 
 fn is_py_ident_chain(t: &str) -> bool {

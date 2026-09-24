@@ -4031,7 +4031,8 @@ mod tests {
 
     /// Python `m.f()` where `m` is import-bound in the calling file: an in-repo module narrows to
     /// that file's module-level defs (or, for `from pkg import Cls`, to Cls's methods); a module
-    /// with no in-repo file at any prefix of its path is external -> unresolved.
+    /// with no in-repo file at any prefix of its path is external -> unresolved. A file that also
+    /// binds the name locally (param, assignment, for/with/except target...) gets no module hint.
     #[test]
     fn python_module_receiver_resolves_via_the_import() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4053,9 +4054,17 @@ mod tests {
              def r4():\n    helpers.helper()\n\ndef r5():\n    User.create()\n\ndef r6(x):\n    np.linalg.norm(x)\n",
         )
         .unwrap();
+        fs::write(
+            root.join("shadow.py"),
+            "from util import helpers\n\ndef p1(helpers):\n    helpers.helper()\n\n\
+             def p2(xs):\n    for helpers in xs:\n        helpers.helper()\n",
+        )
+        .unwrap();
         let mut s = Store::open(root).unwrap();
         s.index_repo(root).unwrap();
         assert_eq!(edge_kinds(&s, "load", "r1").0, "unresolved", "json is external");
+        assert_eq!(edge_kinds(&s, "helper", "p1").0, "ambiguous", "param rebinds the imported name");
+        assert_eq!(edge_kinds(&s, "helper", "p2").0, "ambiguous", "for-target rebinds it");
         for encl in ["r2", "r3", "r4"] {
             assert_eq!(resolved(&s, "helper", encl), ("exact".into(), Some("util/helpers.py".into())), "{encl}");
         }
