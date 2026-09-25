@@ -143,6 +143,89 @@ fn first_base_name(class_node: Node, src: &[u8]) -> Option<String> {
     base.and_then(|b| type_name(b, src))
 }
 
+/// `ident:X` receivers -> the one type every binding of X in the call's function agrees on (else
+/// no hint: two types for one name, or no binding at all, is never guessed). Keyed by enclosing
+/// function NAME, like Python's T1, so same-named functions pool their bindings (conservative).
+/// Never leaves an `ident:` marker behind.
+fn bind_local_receivers(out: &mut ParsedFile) {
+    let mut types: std::collections::HashMap<(String, String), Option<String>> = std::collections::HashMap::new();
+    for (f, v, t) in std::mem::take(&mut out.var_bindings) {
+        types
+            .entry((f, v))
+            .and_modify(|cur| {
+                if cur.as_deref() != Some(t.as_str()) {
+                    *cur = None;
+                }
+            })
+            .or_insert(Some(t));
+    }
+    for c in &mut out.calls {
+        if let Some(x) = c.receiver_class.as_deref().and_then(|r| r.strip_prefix("ident:")) {
+            c.receiver_class = types.get(&(c.enclosing.clone(), x.to_string())).cloned().flatten();
+        }
+    }
+}
+
+/// A Java/C#/C++ declared type as a plain class name: `T`, `a.T`, `ns::T` (and `T*` / `T&` via the
+/// declarator, see `cfam_decl_name`). Generic containers (`List<T>`, `std::vector<T>`), `var` /
+/// `auto`, and primitives -> None.
+fn cfam_type_name<'a>(t: Node, src: &'a [u8]) -> Option<&'a str> {
+    match t.kind() {
+        "type_identifier" | "identifier" => Some(text(t, src)).filter(|n| *n != "var"),
+        "scoped_type_identifier" | "qualified_name" | "qualified_identifier" => {
+            t.child_by_field_name("name").and_then(|n| cfam_type_name(n, src))
+        }
+        _ => None,
+    }
+}
+
+/// The variable a Java/C#/C++ declarator names, seeing through `*`, `&` and `= init`; plus the
+/// initializer when there is one.
+fn cfam_decl_name<'a>(d: Node<'a>, src: &'a [u8]) -> Option<(&'a str, Option<Node<'a>>)> {
+    match d.kind() {
+        "identifier" => Some((text(d, src), None)),
+        "variable_declarator" | "init_declarator" => {
+            let inner = d.child_by_field_name("name").or_else(|| d.child_by_field_name("declarator"))?;
+            let value = d.child_by_field_name("value").or_else(|| {
+                // c#: the initializer is a bare expression child after the name
+                let mut c = d.walk();
+                let v = d.named_children(&mut c).find(|k| k.id() != inner.id() && k.kind() != "bracketed_argument_list");
+                v
+            });
+            cfam_decl_name(inner, src).map(|(n, _)| (n, value))
+        }
+        "pointer_declarator" => d.child_by_field_name("declarator").and_then(|i| cfam_decl_name(i, src)),
+        "reference_declarator" => d.named_child(0).and_then(|i| cfam_decl_name(i, src)),
+        _ => None,
+    }
+}
+
+/// `new T(..)` in Java/C#/C++ -> T (what a `var` / `auto` local holds).
+fn cfam_new_type<'a>(v: Node, src: &'a [u8]) -> Option<&'a str> {
+    matches!(v.kind(), "object_creation_expression" | "new_expression")
+        .then(|| v.child_by_field_name("type"))
+        .flatten()
+        .and_then(|t| cfam_type_name(t, src))
+}
+
+/// A local/param declaration's bindings: explicit class type, else (`var` / `auto`) the `new T`
+/// initializer's type.
+fn push_cfam_bindings<'a>(out: &mut ParsedFile, enclosing: &str, ty: Option<Node>, decls: &[Node<'a>], src: &'a [u8]) {
+    let declared = ty.and_then(|t| cfam_type_name(t, src));
+    for d in decls {
+        if let Some((name, value)) = cfam_decl_name(*d, src) {
+            if let Some(t) = declared.or_else(|| value.and_then(|v| cfam_new_type(v, src))) {
+                out.var_bindings.push((enclosing.to_string(), name.to_string(), t.to_string()));
+            }
+        }
+    }
+}
+
+/// `x.m()` on a plain identifier -> `ident:x` for `bind_local_receivers`.
+fn ident_hint(obj: Option<Node>, src: &[u8]) -> Option<String> {
+    obj.filter(|o| o.kind() == "identifier").map(|o| format!("ident:{}", text(o, src)))
+}
+
 /// `this.m()` / `this->m()`: the receiver object is `this` -> the enclosing class, if known.
 fn this_hint(obj: Option<Node>, ctx: CppCtx) -> Option<String> {
     obj.filter(|o| o.kind() == "this").and(ctx.this_class).map(str::to_string)
@@ -166,7 +249,60 @@ pub fn parse_rust(src: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, tree_sitter_rust::LANGUAGE.into(), "rust")?;
     let mut out = ParsedFile::default();
     walk_rust(tree.root_node(), src.as_bytes(), &mut out, RustCtx { enclosing: "<module>", container: None, self_class: None });
+    bind_local_receivers(&mut out);
     Ok(out)
+}
+
+/// A Rust type as a plain struct name: `T`, `&T`, `&mut T`, `a::T`. Generic wrappers (`Vec<T>`,
+/// `Box<T>`, `Option<T>`) -> None: the receiver isn't a T.
+fn rust_type_name<'a>(t: Node, src: &'a [u8]) -> Option<&'a str> {
+    match t.kind() {
+        "type_identifier" => Some(text(t, src)),
+        "reference_type" => t.child_by_field_name("type").and_then(|i| rust_type_name(i, src)),
+        "scoped_type_identifier" => t.child_by_field_name("name").map(|n| text(n, src)),
+        _ => None,
+    }
+}
+
+/// The type a `let` initializer evidently constructs: `T { .. }`, or a constructor-named associated
+/// call `T::new*` / `T::with_*` / `T::from*` / `T::default()` (`Self::` -> the impl type), seen
+/// through a trailing `?` / `.unwrap()` / `.expect(..)`. Other associated fns (`T::open()` may
+/// return `Result<T>`, `T::builder()` another type) -> None.
+fn rust_ctor_type<'a>(v: Node, src: &'a [u8], self_class: Option<&'a str>) -> Option<&'a str> {
+    match v.kind() {
+        "try_expression" => v.named_child(0).and_then(|i| rust_ctor_type(i, src, self_class)),
+        "struct_expression" => v.child_by_field_name("name").and_then(|n| match n.kind() {
+            "type_identifier" => Some(text(n, src)),
+            "scoped_type_identifier" => n.child_by_field_name("name").map(|x| text(x, src)),
+            _ => None,
+        }),
+        "call_expression" => {
+            let f = v.child_by_field_name("function")?;
+            match f.kind() {
+                // `.unwrap()` / `.expect(..)` on a constructor call
+                "field_expression" => f
+                    .child_by_field_name("field")
+                    .filter(|m| matches!(text(*m, src), "unwrap" | "expect"))
+                    .and_then(|_| f.child_by_field_name("value"))
+                    .and_then(|i| rust_ctor_type(i, src, self_class)),
+                "scoped_identifier" => {
+                    let name = text(f.child_by_field_name("name")?, src);
+                    let ctor = name == "new" || name == "default" || name.starts_with("new_")
+                        || name.starts_with("with_") || name.starts_with("from");
+                    let path = f.child_by_field_name("path")?;
+                    let ty = match path.kind() {
+                        "identifier" if text(path, src) == "Self" => self_class,
+                        "identifier" => Some(text(path, src)),
+                        "scoped_identifier" => path.child_by_field_name("name").map(|n| text(n, src)),
+                        _ => None,
+                    };
+                    ty.filter(|_| ctor)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -220,11 +356,13 @@ fn walk_rust<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: RustCtx<'
                     "identifier" => push_call(out, text(f, src), "func", node, ctx.enclosing, None),
                     "field_expression" => {
                         if let Some(field) = f.child_by_field_name("field") {
-                            // hint only for the syntactically-free case: `self.foo()` in `impl T`
-                            let recv = f
-                                .child_by_field_name("value")
-                                .filter(|v| v.kind() == "self")
-                                .and_then(|_| ctx.self_class.map(str::to_string));
+                            // `self.foo()` in `impl T` -> T; `x.foo()` -> `ident:x` for the local
+                            // binding post-pass (`let x = T::new()`, `x: &T`, ...)
+                            let recv = f.child_by_field_name("value").and_then(|v| match v.kind() {
+                                "self" => ctx.self_class.map(str::to_string),
+                                "identifier" => Some(format!("ident:{}", text(v, src))),
+                                _ => None,
+                            });
                             push_call(out, text(field, src), "method", node, ctx.enclosing, recv);
                         }
                     }
@@ -244,6 +382,16 @@ fn walk_rust<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: RustCtx<'
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+        "let_declaration" | "parameter" => {
+            if let Some(pat) = node.child_by_field_name("pattern").filter(|p| p.kind() == "identifier") {
+                let ty = node.child_by_field_name("type").and_then(|t| rust_type_name(t, src)).or_else(|| {
+                    node.child_by_field_name("value").and_then(|v| rust_ctor_type(v, src, ctx.self_class))
+                });
+                if let Some(t) = ty {
+                    out.var_bindings.push((ctx.enclosing.to_string(), text(pat, src).to_string(), t.to_string()));
                 }
             }
         }
@@ -412,6 +560,7 @@ pub fn parse_cpp(src: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, tree_sitter_cpp::LANGUAGE.into(), "cpp")?;
     let mut out = ParsedFile::default();
     walk_cpp(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
+    bind_local_receivers(&mut out);
     Ok(out)
 }
 
@@ -465,7 +614,8 @@ fn walk_cpp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>
                     "identifier" => push_call(out, text(f, src), "func", node, ctx.enclosing, None),
                     "field_expression" => {
                         if let Some(field) = f.child_by_field_name("field") {
-                            let recv = this_hint(f.child_by_field_name("argument"), ctx);
+                            let arg = f.child_by_field_name("argument");
+                            let recv = this_hint(arg, ctx).or_else(|| ident_hint(arg, src));
                             push_call(out, text(field, src), "method", node, ctx.enclosing, recv);
                         }
                     }
@@ -480,6 +630,12 @@ fn walk_cpp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>
                 }
             }
         }
+        "declaration" | "parameter_declaration" => {
+            let mut c = node.walk();
+            let decls: Vec<Node> = node.children_by_field_name("declarator", &mut c).collect();
+            let ty = node.child_by_field_name("type").filter(|t| t.kind() != "placeholder_type_specifier");
+            push_cfam_bindings(out, ctx.enclosing, ty, &decls, src);
+        }
         "preproc_include" => push_import(out, node, src),
         _ => {}
     }
@@ -492,6 +648,7 @@ pub fn parse_csharp(src: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, tree_sitter_c_sharp::LANGUAGE.into(), "c-sharp")?;
     let mut out = ParsedFile::default();
     walk_csharp(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
+    bind_local_receivers(&mut out);
     Ok(out)
 }
 
@@ -526,12 +683,26 @@ fn walk_csharp<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<
                     "identifier" => push_call(out, text(f, src), "func", node, ctx.enclosing, None),
                     "member_access_expression" => {
                         if let Some(name) = f.child_by_field_name("name") {
-                            let recv = this_hint(f.child_by_field_name("expression"), ctx);
+                            let e = f.child_by_field_name("expression");
+                            let recv = this_hint(e, ctx).or_else(|| ident_hint(e, src));
                             push_call(out, text(name, src), "method", node, ctx.enclosing, recv);
                         }
                     }
                     _ => {}
                 }
+            }
+        }
+        "local_declaration_statement" => {
+            if let Some(vd) = find_child(node, "variable_declaration") {
+                let mut c = vd.walk();
+                let decls: Vec<Node> = vd.named_children(&mut c).filter(|k| k.kind() == "variable_declarator").collect();
+                let ty = vd.child_by_field_name("type").filter(|t| t.kind() != "implicit_type");
+                push_cfam_bindings(out, ctx.enclosing, ty, &decls, src);
+            }
+        }
+        "parameter" => {
+            if let Some(n) = node.child_by_field_name("name") {
+                push_cfam_bindings(out, ctx.enclosing, node.child_by_field_name("type"), &[n], src);
             }
         }
         "using_directive" => {
@@ -564,6 +735,7 @@ pub fn parse_java(src: &str) -> anyhow::Result<ParsedFile> {
     let tree = tree_for(src, tree_sitter_java::LANGUAGE.into(), "java")?;
     let mut out = ParsedFile::default();
     walk_java(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
+    bind_local_receivers(&mut out);
     Ok(out)
 }
 
@@ -590,8 +762,16 @@ fn walk_java<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a
                 // `x.foo()` -> method; bare `foo()` -> func; `this.foo()` -> enclosing class hint
                 let obj = node.child_by_field_name("object");
                 let kind = if obj.is_some() { "method" } else { "func" };
-                push_call(out, text(name, src), kind, node, ctx.enclosing, this_hint(obj, ctx));
+                push_call(out, text(name, src), kind, node, ctx.enclosing, this_hint(obj, ctx).or_else(|| ident_hint(obj, src)));
             }
+        }
+        "local_variable_declaration" | "formal_parameter" => {
+            let mut c = node.walk();
+            let mut decls: Vec<Node> = node.children_by_field_name("declarator", &mut c).collect();
+            if let Some(n) = node.child_by_field_name("name") {
+                decls.push(n); // formal_parameter names the variable directly
+            }
+            push_cfam_bindings(out, ctx.enclosing, node.child_by_field_name("type"), &decls, src);
         }
         "import_declaration" => {
             push_import(out, node, src);
@@ -644,13 +824,26 @@ fn parse_js_family(src: &str, language: Language, what: &str) -> anyhow::Result<
                 c.receiver_class = None;
             }
         } else if let Some(x) = r.strip_prefix("ident:") {
-            c.receiver_class = namespaces
-                .get(x)
-                .filter(|_| !declared_locally.contains(x))
-                .map(|spec| format!("jsmod:{spec}"));
+            // a namespace import wins; otherwise leave `ident:` for the local-binding pass
+            if let Some(spec) = namespaces.get(x).filter(|_| !declared_locally.contains(x)) {
+                c.receiver_class = Some(format!("jsmod:{spec}"));
+            }
         }
     }
+    bind_local_receivers(&mut out);
     Ok(out)
+}
+
+/// A TS type annotation / `new` target as a plain class name: `T`, `ns.T`. Generics, unions,
+/// arrays, primitives -> None.
+fn js_type_name<'a>(t: Node, src: &'a [u8]) -> Option<&'a str> {
+    match t.kind() {
+        "type_annotation" => t.named_child(0).and_then(|i| js_type_name(i, src)),
+        "type_identifier" | "identifier" => Some(text(t, src)),
+        "nested_type_identifier" => t.child_by_field_name("name").map(|n| text(n, src)),
+        "member_expression" => t.child_by_field_name("property").map(|n| text(n, src)),
+        _ => None,
+    }
 }
 
 /// Built-in global objects of the JS runtimes (browser + Node): `Promise.all()`, `Math.max()`,
@@ -752,8 +945,29 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
                 child_ctx = CppCtx { enclosing: nm, container: None, this_class: ctx.container };
             }
         }
+        // `(x: T)` params (TS)
+        "required_parameter" | "optional_parameter" => {
+            if let (Some(p), Some(t)) = (
+                node.child_by_field_name("pattern").filter(|p| p.kind() == "identifier"),
+                node.child_by_field_name("type").and_then(|t| js_type_name(t, src)),
+            ) {
+                out.var_bindings.push((ctx.enclosing.to_string(), text(p, src).to_string(), t.to_string()));
+            }
+        }
         // `const x = () => ..` / `const x = function ..` — cheap and very common (spec L1.3)
         "variable_declarator" => {
+            // local binding for receiver narrowing: `const x: T = ..` or `const x = new T(..)`
+            if let Some(name) = node.child_by_field_name("name").filter(|n| n.kind() == "identifier") {
+                let ty = node.child_by_field_name("type").and_then(|t| js_type_name(t, src)).or_else(|| {
+                    node.child_by_field_name("value")
+                        .filter(|v| v.kind() == "new_expression")
+                        .and_then(|v| v.child_by_field_name("constructor"))
+                        .and_then(|c| js_type_name(c, src))
+                });
+                if let Some(t) = ty {
+                    out.var_bindings.push((ctx.enclosing.to_string(), text(name, src).to_string(), t.to_string()));
+                }
+            }
             if let (Some(name), Some(value)) = (node.child_by_field_name("name"), node.child_by_field_name("value")) {
                 if name.kind() == "identifier"
                     && matches!(value.kind(), "arrow_function" | "function_expression" | "function")

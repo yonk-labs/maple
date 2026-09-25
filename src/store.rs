@@ -4302,6 +4302,81 @@ mod tests {
         assert_eq!(edge_kinds(&s, "helper", "a7").0, "ambiguous", "alias namespace: fall back");
     }
 
+    /// Local receiver types (Rust, TS/JS, Java, C#, C++): `x.m()` narrows to T when every binding of `x` in the
+    /// function names the same T — constructor calls, struct literals, annotations, typed params.
+    /// Two different types for the same name -> no hint (never guessed).
+    #[test]
+    fn local_constructor_and_annotation_bindings_hint_the_receiver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lib.rs"),
+            "pub struct A { v: i32 }\npub struct B;\n\
+             impl A { pub fn new() -> Self { A { v: 0 } } pub fn go(&self) {} }\n\
+             impl B { pub fn go(&self) {} }\n\
+             fn r1() { let a = A::new(); a.go(); }\nfn r2(b: &B) { b.go(); }\n\
+             fn r3() { let a = A { v: 1 }; a.go(); }\nfn r4() { let x: A = make(); x.go(); }\n\
+             fn r5() { let x = A::new(); let x = B::default(); x.go(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("t.ts"),
+            "class P { go() {} }\nclass Q { go() {} }\n\
+             function t1() { const p = new P(); p.go(); }\nfunction t2(q: Q) { q.go(); }\n\
+             function t3() { let p: P = make(); p.go(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("J.java"),
+            "class JA { void go() {} }\nclass JB { void go() {} }\n\
+             class Use { void j1() { JA a = make(); a.go(); } void j2(JB b) { b.go(); } void j3() { var a = new JA(); a.go(); } }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("C.cs"),
+            "class CA { void Go() {} }\nclass CB { void Go() {} }\n\
+             class Use2 { void C1() { CA a = Make(); a.Go(); } void C2(CB b) { b.Go(); } void C3() { var a = new CA(); a.Go(); } }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("p.cpp"),
+            "struct XA { void go() {} };\nstruct XB { void go() {} };\n\
+             void x1() { XA a; a.go(); }\nvoid x2(const XB& b) { b.go(); }\nvoid x3() { auto p = new XA(); p->go(); }\n\
+             void x4(XB* b) { b->go(); }\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        let target = |callee: &str, encl: &str| -> (String, Option<String>) {
+            s.conn
+                .query_row(
+                    "SELECT e.kind, t.parent_class FROM edges e JOIN symbols c ON e.caller_symbol=c.id \
+                     LEFT JOIN symbols t ON e.callee_symbol=t.id WHERE e.callee_name=?1 AND c.name=?2",
+                    params![callee, encl],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(target("go", "r1"), ("exact".into(), Some("A".into())), "let x = T::new()");
+        assert_eq!(target("go", "r2"), ("exact".into(), Some("B".into())), "typed param &B");
+        assert_eq!(target("go", "r3"), ("exact".into(), Some("A".into())), "struct literal");
+        assert_eq!(target("go", "r4"), ("exact".into(), Some("A".into())), "let x: A");
+        assert_eq!(target("go", "r5").0, "ambiguous", "x bound to A and B -> no hint");
+        assert_eq!(target("go", "t1"), ("exact".into(), Some("P".into())), "new P()");
+        assert_eq!(target("go", "t2"), ("exact".into(), Some("Q".into())), "(q: Q)");
+        assert_eq!(target("go", "t3"), ("exact".into(), Some("P".into())), "let p: P");
+        assert_eq!(target("go", "j1"), ("exact".into(), Some("JA".into())), "java JA a");
+        assert_eq!(target("go", "j2"), ("exact".into(), Some("JB".into())), "java param");
+        assert_eq!(target("go", "j3"), ("exact".into(), Some("JA".into())), "java var = new");
+        assert_eq!(target("Go", "C1"), ("exact".into(), Some("CA".into())), "c# CA a");
+        assert_eq!(target("Go", "C2"), ("exact".into(), Some("CB".into())), "c# param");
+        assert_eq!(target("Go", "C3"), ("exact".into(), Some("CA".into())), "c# var = new");
+        assert_eq!(target("go", "x1"), ("exact".into(), Some("XA".into())), "c++ XA a;");
+        assert_eq!(target("go", "x2"), ("exact".into(), Some("XB".into())), "c++ const XB&");
+        assert_eq!(target("go", "x3"), ("exact".into(), Some("XA".into())), "c++ auto = new");
+        assert_eq!(target("go", "x4"), ("exact".into(), Some("XB".into())), "c++ XB*");
+    }
+
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind
     /// `method` with the free `self`-in-`impl` receiver hint; defs carry the impl-type container.
     #[test]

@@ -167,6 +167,11 @@ pub struct ParsedFile {
     pub imports: Vec<Import>,
     pub aliases: Vec<Alias>,
     pub import_names: Vec<ImportName>,
+    /// Local receiver-type bindings from the non-Python walks: (enclosing fn, var, type) from
+    /// constructor calls, struct literals, annotations, typed params. Consumed by the walks'
+    /// `bind_local_receivers` post-pass; internal, never serialized.
+    #[serde(skip)]
+    pub var_bindings: Vec<(String, String, String)>,
     /// L2 — set by the SQL walks when the tree parsed without errors: a `.sql` file with zero
     /// defs/calls (a DDL-only migration) is legitimately symbolless, not "suspect". Internal flag
     /// for the store's suspect check, never serialized.
