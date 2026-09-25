@@ -69,6 +69,10 @@ and no call-site was lost.
   `a::T`), `new T(..)` (incl. `var` / `auto`), Rust `T { .. }` and constructor-named associated
   calls only (`T::new*`, `with_*`, `from*`, `default`, through `?` / `.unwrap()` / `.expect()`).
   Generic containers and other associated fns (`T::open()` may return `Result<T>`) never bind.
+  JS/TS reassignment `x = new U()` with U != T voids the hint (runtime dispatch). Any other
+  reassignment voids it in plain JS (no static type) but not in TS, whose checker keeps the
+  declared/inferred type (voiding there cost Excalibur 540 correct exacts on `engine = ...` setup).
+  Java/C#/C++ locals resolve against their declared static type, the `this`/`self` convention.
   This batch (JS imports + scoped shadowing + local types) vs 0.3.11 on 18 repos: exact +12,019,
   ambiguous -12,585 (godot +7,372, Excalibur +3,112, the-horde +505, chunkshop-rust-media +251);
   every changed edge sits at a site one of these rules touches, no exact edge lost, edge totals
