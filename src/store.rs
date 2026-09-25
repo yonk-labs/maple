@@ -2189,8 +2189,9 @@ const JS_KNOWN_EXTERNAL: &[&str] = &[
     "react-dom", "vue", "svelte", "lodash", "express", "axios", "zod",
 ];
 
-/// In-repo files a relative JS/TS specifier can mean from `from_file`: the path itself, with each
-/// JS/TS extension, or as a directory's `index.*`; TS-ESM `./x.js` also tries `./x.ts`.
+/// The in-repo file a relative JS/TS specifier resolves to from `from_file`, first match in
+/// TS/Node order: the path itself, then each JS/TS extension (TS-ESM `./x.js` also tries
+/// `./x.ts`), then a directory's `index.*` — so `./x` with both x.ts and x/index.ts is x.ts.
 fn js_module_files(conn: &Connection, from_file: &str, spec: &str) -> Result<Vec<String>> {
     const EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
     let mut parts: Vec<&str> = from_file.split('/').collect();
@@ -2207,14 +2208,13 @@ fn js_module_files(conn: &Connection, from_file: &str, spec: &str) -> Result<Vec
     let joined = parts.join("/");
     let base = EXTS.iter().find_map(|e| joined.strip_suffix(e)).unwrap_or(&joined);
     let mut paths = vec![joined.clone()];
-    for e in EXTS {
-        paths.push(format!("{base}{e}"));
-        paths.push(format!("{joined}/index{e}"));
-    }
+    paths.extend(EXTS.iter().map(|e| format!("{base}{e}")));
+    paths.extend(EXTS.iter().map(|e| format!("{joined}/index{e}")));
     let sql = format!("SELECT path FROM files WHERE path IN ({})", vec!["?"; paths.len()].join(","));
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(paths.iter()), |r| r.get(0))?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let found: Vec<String> =
+        stmt.query_map(params_from_iter(paths.iter()), |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    Ok(paths.into_iter().find(|p| found.contains(p)).into_iter().collect())
 }
 
 /// In-repo files for dotted Python module `m`: `a/b.py` or `a/b/__init__.py`, by path suffix.
@@ -4273,6 +4273,10 @@ mod tests {
         fs::create_dir_all(root.join("lib")).unwrap();
         fs::write(root.join("lib/util.ts"), "export function helper() {}\nexport function other() {}\n").unwrap();
         fs::write(root.join("lib/index.ts"), "export function idx() {}\n").unwrap();
+        // `./dup` with both dup.ts and dup/index.ts: TS resolution takes the file first
+        fs::create_dir_all(root.join("dup")).unwrap();
+        fs::write(root.join("dup.ts"), "export function twin() {}\n").unwrap();
+        fs::write(root.join("dup/index.ts"), "export function twin() {}\n").unwrap();
         fs::write(
             root.join("elsewhere.ts"),
             "export function helper() {}\nexport function other() {}\nexport function idx() {}\n\
@@ -4286,7 +4290,8 @@ mod tests {
              function a1() { helper(); }\nfunction a2() { U.other(); }\nfunction a3() { idx(); }\n\
              function a4() { other(); }\nfunction a5() { expect(1); }\nfunction a6() { path.relative('a'); }\n\
              import * as me from '@myalias';\nimport { idx as i2 } from 'some-pkg';\n\
-             function a7() { me.helper(); }\nfunction a8() { idx(); }\n",
+             function a7() { me.helper(); }\nfunction a8() { idx(); }\n\
+             import { twin } from './dup';\nfunction a9() { twin(); }\n",
         )
         .unwrap();
         let mut s = Store::open(root).unwrap();
@@ -4300,6 +4305,7 @@ mod tests {
         // an unknown package / tsconfig alias (the repo importing itself as '@myalias') is never
         // declared external: the old answer stands
         assert_eq!(edge_kinds(&s, "helper", "a7").0, "ambiguous", "alias namespace: fall back");
+        assert_eq!(resolved(&s, "twin", "a9"), ("exact".into(), Some("dup.ts".into())), "file before dir/index");
     }
 
     /// Local receiver types (Rust, TS/JS, Java, C#, C++): `x.m()` narrows to T when every binding of `x` in the
