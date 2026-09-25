@@ -161,7 +161,9 @@ fn bind_local_receivers(out: &mut ParsedFile) {
     }
     for c in &mut out.calls {
         if let Some(x) = c.receiver_class.as_deref().and_then(|r| r.strip_prefix("ident:")) {
-            c.receiver_class = types.get(&(c.enclosing.clone(), x.to_string())).cloned().flatten();
+            // "?" = assigned something of unknown type (JS reassignment): never a hint
+            c.receiver_class =
+                types.get(&(c.enclosing.clone(), x.to_string())).cloned().flatten().filter(|t| t != "?");
         }
     }
 }
@@ -830,6 +832,18 @@ fn parse_js_family(src: &str, language: Language, what: &str) -> anyhow::Result<
             }
         }
     }
+    // TS type-checks every reassignment against the declared / inferred type, so `x = null` or
+    // `x = factory()` can't change it: only a reassignment to a different `new T()` still counts
+    // (conservative about runtime dispatch). Plain JS has no static type: every reassignment counts.
+    let typescript = what != "javascript";
+    out.var_bindings.retain_mut(|(_, _, t)| match t.strip_prefix('=') {
+        Some("?") if typescript => false,
+        Some(rest) => {
+            *t = rest.to_string();
+            true
+        }
+        None => true,
+    });
     bind_local_receivers(&mut out);
     Ok(out)
 }
@@ -943,6 +957,20 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
                 let nm = text(name, src);
                 out.defs.push(mk_def(nm, "function", ctx.container, node, src, leading_doc(node, src)));
                 child_ctx = CppCtx { enclosing: nm, container: None, this_class: ctx.container };
+            }
+        }
+        // `x = ...` later in the function: dispatch is on the runtime object, so a reassignment is a
+        // binding too — `new T()` binds T, anything else "?" (disagrees with every type -> no hint).
+        // Marked "=" so parse_js_family can drop the "?" ones for TS (see there).
+        "assignment_expression" => {
+            if let Some(l) = node.child_by_field_name("left").filter(|l| l.kind() == "identifier") {
+                let ty = node
+                    .child_by_field_name("right")
+                    .filter(|r| r.kind() == "new_expression")
+                    .and_then(|r| r.child_by_field_name("constructor"))
+                    .and_then(|c| js_type_name(c, src))
+                    .unwrap_or("?");
+                out.var_bindings.push((ctx.enclosing.to_string(), text(l, src).to_string(), format!("={ty}")));
             }
         }
         // `(x: T)` params (TS)

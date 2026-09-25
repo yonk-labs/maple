@@ -4329,7 +4329,15 @@ mod tests {
             root.join("t.ts"),
             "class P { go() {} }\nclass Q { go() {} }\n\
              function t1() { const p = new P(); p.go(); }\nfunction t2(q: Q) { q.go(); }\n\
-             function t3() { let p: P = make(); p.go(); }\n",
+             function t3() { let p: P = make(); p.go(); }\n\
+             function t4() { let p = new P(); p = new Q(); p.go(); }\nfunction t5() { let p = new P(); p = make(); p.go(); }\n\
+             function t6() { let p = new P(); p = new P(); p.go(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("k.js"),
+            "class P2 { go2() {} }\nclass Q2 { go2() {} }\n\
+             function k1() { let p = new P2(); p = make(); p.go2(); }\nfunction k2() { const p = new P2(); p.go2(); }\n",
         )
         .unwrap();
         fs::write(
@@ -4371,6 +4379,14 @@ mod tests {
         assert_eq!(target("go", "t1"), ("exact".into(), Some("P".into())), "new P()");
         assert_eq!(target("go", "t2"), ("exact".into(), Some("Q".into())), "(q: Q)");
         assert_eq!(target("go", "t3"), ("exact".into(), Some("P".into())), "let p: P");
+        // a reassignment to a different `new T()` voids the hint (runtime dispatch) ...
+        assert_eq!(target("go", "t4").0, "ambiguous", "p reassigned to new Q()");
+        assert_eq!(target("go", "t6"), ("exact".into(), Some("P".into())), "reassigned to the same type");
+        // ... but in TS an unknown-value reassignment can't change the checked static type
+        assert_eq!(target("go", "t5"), ("exact".into(), Some("P".into())), "ts: p = make() keeps P");
+        // plain JS has no static type: any reassignment voids it
+        assert_eq!(target("go2", "k1").0, "ambiguous", "js: p = make() -> no hint");
+        assert_eq!(target("go2", "k2"), ("exact".into(), Some("P2".into())), "js: new P2() only");
         assert_eq!(target("go", "j1"), ("exact".into(), Some("JA".into())), "java JA a");
         assert_eq!(target("go", "j2"), ("exact".into(), Some("JB".into())), "java param");
         assert_eq!(target("go", "j3"), ("exact".into(), Some("JA".into())), "java var = new");
