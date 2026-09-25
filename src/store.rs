@@ -1914,6 +1914,12 @@ fn resolve_call(
             if rc.starts_with("global:") {
                 return Ok((None, "unresolved"));
             }
+            // JS/TS `ns.f()` on `import * as ns from spec` (parser hint `jsmod:<spec>`)
+            if let Some(spec) = rc.strip_prefix("jsmod:") {
+                if let Some(hit) = resolve_js_import(conn, spec, &cands, call_site_file)? {
+                    return Ok(hit);
+                }
+            }
             // hint is trusted only if `rc` names exactly one same-language symbol and it's a class.
             // Java/C#/C++ constructors share their class's name (`Foo::Foo`), so they don't count.
             let mut cstmt = conn.prepare_cached(
@@ -1954,6 +1960,18 @@ fn resolve_call(
             }
         }
     } else if call_kind == "func" {
+        // JS/TS: a bare call to a name this file imports resolves in the imported module's file
+        if matches!(lang, "javascript" | "typescript") {
+            let spec: Option<String> = conn
+                .prepare_cached("SELECT source_module FROM import_names WHERE file=?1 AND local=?2 LIMIT 1")?
+                .query_row(params![call_site_file, name], |r| r.get(0))
+                .optional()?;
+            if let Some(spec) = spec {
+                if let Some(hit) = resolve_js_import(conn, &spec, &cands, call_site_file)? {
+                    return Ok(hit);
+                }
+            }
+        }
         let mod_level: Vec<&(i64, Option<String>, String)> =
             cands.iter().filter(|(_, pc, _)| pc.is_none()).collect();
 
@@ -2080,15 +2098,6 @@ fn resolve_module_attr(
     path: &str,
     cands: &[(i64, Option<String>, String)],
 ) -> Result<Option<(Option<i64>, &'static str)>> {
-    let pick = |hits: Vec<&(i64, Option<String>, String)>| -> Option<(Option<i64>, &'static str)> {
-        match hits.len() {
-            0 => None, // module has no such def (re-export / dynamic) -> fall back
-            1 => Some((Some(hits[0].0), "exact")),
-            // same file re-def: last one (parse order) wins, as T3(b); across files: ambiguous
-            _ if hits.iter().all(|h| h.2 == hits[0].2) => hits.iter().max_by_key(|h| h.0).map(|h| (Some(h.0), "exact")),
-            _ => Some((None, "ambiguous")),
-        }
-    };
     let mut prefix = path;
     loop {
         let files = python_module_files(conn, prefix)?;
@@ -2116,6 +2125,96 @@ fn resolve_module_attr(
             None => return Ok(Some((None, "unresolved"))),
         }
     }
+}
+
+/// The answer for a module-scoped lookup's matching defs: none -> None (re-export / dynamic: the
+/// caller's universal answer stands); one -> exact; several in one file -> the last (parse order,
+/// as T3(b)); across files -> ambiguous.
+fn pick(hits: Vec<&(i64, Option<String>, String)>) -> Option<(Option<i64>, &'static str)> {
+    match hits.len() {
+        0 => None,
+        1 => Some((Some(hits[0].0), "exact")),
+        _ if hits.iter().all(|h| h.2 == hits[0].2) => hits.iter().max_by_key(|h| h.0).map(|h| (Some(h.0), "exact")),
+        _ => Some((None, "ambiguous")),
+    }
+}
+
+/// JS/TS name imported from module specifier `spec` by `from_file`:
+/// - relative (`./x`, `../x`): the resolved file's module-level defs; target not indexed -> None;
+/// - `node:*`, a Node core module, or a well-known package (JS_KNOWN_EXTERNAL), with no
+///   same-named directory in the repo -> external -> unresolved;
+/// - anything else -> None: the universal answer stands. A bare specifier can be a tsconfig path
+///   alias or the repo importing itself (Excalibur's tests import `'@excalibur'` / `'excalibur'`),
+///   which can't be told from a real package without reading tsconfig/package.json.
+fn resolve_js_import(
+    conn: &Connection,
+    spec: &str,
+    cands: &[(i64, Option<String>, String)],
+    from_file: &str,
+) -> Result<Option<(Option<i64>, &'static str)>> {
+    if spec.starts_with('.') {
+        let files = js_module_files(conn, from_file, spec)?;
+        if files.is_empty() {
+            return Ok(None);
+        }
+        return Ok(pick(cands.iter().filter(|(_, pc, f)| pc.is_none() && files.contains(f)).collect()));
+    }
+    if spec.starts_with("node:") {
+        return Ok(Some((None, "unresolved")));
+    }
+    let mut segs = spec.split('/');
+    let first = segs.next().unwrap_or("");
+    let (pkg_name, pkg) = match (first.starts_with('@'), segs.next()) {
+        (true, Some(second)) => (format!("{first}/{second}"), second),
+        _ => (first.to_string(), first),
+    };
+    if !JS_KNOWN_EXTERNAL.contains(&pkg_name.as_str()) {
+        return Ok(None);
+    }
+    let in_repo: bool = conn
+        .prepare_cached("SELECT 1 FROM files WHERE instr('/' || path, '/' || ?1 || '/') > 0 LIMIT 1")?
+        .query_row([pkg], |_| Ok(()))
+        .optional()?
+        .is_some();
+    Ok((!in_repo).then_some((None, "unresolved")))
+}
+
+/// Node core modules and a few ubiquitous packages whose imports are external for certain (unless
+/// the repo IS that package: see the same-named-directory guard in `resolve_js_import`).
+const JS_KNOWN_EXTERNAL: &[&str] = &[
+    "assert", "async_hooks", "buffer", "child_process", "cluster", "crypto", "dgram", "dns", "events", "fs",
+    "http", "http2", "https", "module", "net", "os", "path", "perf_hooks", "process", "querystring", "readline",
+    "stream", "string_decoder", "timers", "tls", "tty", "url", "util", "v8", "vm", "worker_threads", "zlib",
+    "vitest", "jest", "@jest/globals", "mocha", "chai", "sinon", "@playwright/test", "playwright", "react",
+    "react-dom", "vue", "svelte", "lodash", "express", "axios", "zod",
+];
+
+/// In-repo files a relative JS/TS specifier can mean from `from_file`: the path itself, with each
+/// JS/TS extension, or as a directory's `index.*`; TS-ESM `./x.js` also tries `./x.ts`.
+fn js_module_files(conn: &Connection, from_file: &str, spec: &str) -> Result<Vec<String>> {
+    const EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
+    let mut parts: Vec<&str> = from_file.split('/').collect();
+    parts.pop(); // the importing file's own name
+    for seg in spec.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    let joined = parts.join("/");
+    let base = EXTS.iter().find_map(|e| joined.strip_suffix(e)).unwrap_or(&joined);
+    let mut paths = vec![joined.clone()];
+    for e in EXTS {
+        paths.push(format!("{base}{e}"));
+        paths.push(format!("{joined}/index{e}"));
+    }
+    let sql = format!("SELECT path FROM files WHERE path IN ({})", vec!["?"; paths.len()].join(","));
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(paths.iter()), |r| r.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// In-repo files for dotted Python module `m`: `a/b.py` or `a/b/__init__.py`, by path suffix.
@@ -4149,6 +4248,46 @@ mod tests {
         assert_eq!(edge_kinds(&s, "all", "waitAll").0, "unresolved", "Promise.all is the global's");
         assert_eq!(edge_kinds(&s, "log", "say").0, "unresolved", "console.log is the global's");
         assert_ne!(edge_kinds(&s, "max", "f").0, "unresolved", "file declares its own Math");
+    }
+
+    /// JS/TS: a bare call to a name imported from a relative module resolves in THAT file (incl.
+    /// `./dir` -> dir/index.ts and TS-ESM `./x.js` -> x.ts), `ns.f()` on `import * as ns` likewise;
+    /// a name or namespace imported from a known-external package (node core, vitest, ...) is
+    /// unresolved; any other specifier (tsconfig alias, workspace or unknown package) falls back.
+    #[test]
+    fn js_import_bound_calls_resolve_in_the_imported_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(root.join("lib/util.ts"), "export function helper() {}\nexport function other() {}\n").unwrap();
+        fs::write(root.join("lib/index.ts"), "export function idx() {}\n").unwrap();
+        fs::write(
+            root.join("elsewhere.ts"),
+            "export function helper() {}\nexport function other() {}\nexport function idx() {}\n\
+             export function expect(x: any) {}\nexport function relative(p: string) {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app.ts"),
+            "import { helper } from './lib/util';\nimport * as U from './lib/util';\nimport { idx } from './lib';\n\
+             import { other } from './lib/util.js';\nimport { expect } from 'vitest';\nimport * as path from 'node:path';\n\
+             function a1() { helper(); }\nfunction a2() { U.other(); }\nfunction a3() { idx(); }\n\
+             function a4() { other(); }\nfunction a5() { expect(1); }\nfunction a6() { path.relative('a'); }\n\
+             import * as me from '@myalias';\nimport { idx as i2 } from 'some-pkg';\n\
+             function a7() { me.helper(); }\nfunction a8() { idx(); }\n",
+        )
+        .unwrap();
+        let mut s = Store::open(root).unwrap();
+        s.index_repo(root).unwrap();
+        assert_eq!(resolved(&s, "helper", "a1"), ("exact".into(), Some("lib/util.ts".into())), "named import");
+        assert_eq!(resolved(&s, "other", "a2"), ("exact".into(), Some("lib/util.ts".into())), "namespace import");
+        assert_eq!(resolved(&s, "idx", "a3"), ("exact".into(), Some("lib/index.ts".into())), "dir -> index.ts");
+        assert_eq!(resolved(&s, "other", "a4"), ("exact".into(), Some("lib/util.ts".into())), "TS-ESM .js -> .ts");
+        assert_eq!(edge_kinds(&s, "expect", "a5").0, "unresolved", "package import");
+        assert_eq!(edge_kinds(&s, "relative", "a6").0, "unresolved", "node: namespace import");
+        // an unknown package / tsconfig alias (the repo importing itself as '@myalias') is never
+        // declared external: the old answer stands
+        assert_eq!(edge_kinds(&s, "helper", "a7").0, "ambiguous", "alias namespace: fall back");
     }
 
     /// L1.4 Rust — cross-file func call exact; `use .. as` alias binds; method call lands kind

@@ -631,11 +631,23 @@ fn parse_js_family(src: &str, language: Language, what: &str) -> anyhow::Result<
     let tree = tree_for(src, language, what)?;
     let mut out = ParsedFile::default();
     walk_js(tree.root_node(), src.as_bytes(), &mut out, CppCtx { enclosing: "<module>", container: None, this_class: None });
-    // a `global:X` hint only stands if this file never declares its own `X` (then it's that binding)
-    let declared = js_declared_names(tree.root_node(), src.as_bytes());
+    // a `global:X` hint only stands if this file never declares its own `X` (then it's that binding);
+    // an `ident:X` receiver becomes `jsmod:<spec>` when X is an `import * as X from spec` binding
+    // the file doesn't also declare some other way, else no hint
+    let declared = js_declared_names(tree.root_node(), src.as_bytes(), true);
+    let declared_locally = js_declared_names(tree.root_node(), src.as_bytes(), false);
+    let namespaces = js_namespace_imports(tree.root_node(), src.as_bytes());
     for c in &mut out.calls {
-        if c.receiver_class.as_deref().and_then(|r| r.strip_prefix("global:")).is_some_and(|g| declared.contains(g)) {
-            c.receiver_class = None;
+        let Some(r) = c.receiver_class.as_deref() else { continue };
+        if let Some(g) = r.strip_prefix("global:") {
+            if declared.contains(g) {
+                c.receiver_class = None;
+            }
+        } else if let Some(x) = r.strip_prefix("ident:") {
+            c.receiver_class = namespaces
+                .get(x)
+                .filter(|_| !declared_locally.contains(x))
+                .map(|spec| format!("jsmod:{spec}"));
         }
     }
     Ok(out)
@@ -651,16 +663,49 @@ const JS_GLOBALS: &[&str] = &[
     "process", "Buffer", "crypto", "performance", "URL",
 ];
 
-/// Every name this file declares anywhere (variables incl. destructuring, parameters, imports,
-/// catch params, function/class/enum names) — scope-blind on purpose: any declaration of `Math`
-/// anywhere in the file drops every `global:Math` hint in it (conservative).
-fn js_declared_names(root: Node, src: &[u8]) -> std::collections::HashSet<String> {
+/// `import * as ns from "spec"` bindings: ns -> spec.
+fn js_namespace_imports(root: Node, src: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "import_statement" {
+            if let (Some(source), Some(ns)) = (n.child_by_field_name("source"), find_descendant(n, "namespace_import")) {
+                if let Some(id) = find_child(ns, "identifier") {
+                    let spec = text(source, src).trim_matches(|c| c == '"' || c == '\'' || c == '`');
+                    map.insert(text(id, src).to_string(), spec.to_string());
+                }
+            }
+            continue;
+        }
+        let mut c = n.walk();
+        stack.extend(n.named_children(&mut c));
+    }
+    map
+}
+
+fn find_descendant<'t>(n: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    let mut stack = vec![n];
+    while let Some(x) = stack.pop() {
+        if x.kind() == kind {
+            return Some(x);
+        }
+        let mut c = x.walk();
+        stack.extend(x.named_children(&mut c));
+    }
+    None
+}
+
+/// Every name this file declares anywhere (variables incl. destructuring, parameters, catch params,
+/// function/class/enum names, and imports when `with_imports`) — scope-blind on purpose: any
+/// declaration of `Math` anywhere in the file drops every `global:Math` hint in it (conservative).
+fn js_declared_names(root: Node, src: &[u8], with_imports: bool) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         let decl = match n.kind() {
             "variable_declarator" => n.child_by_field_name("name"),
-            "formal_parameters" | "import_clause" => Some(n),
+            "formal_parameters" => Some(n),
+            "import_clause" if with_imports => Some(n),
             "catch_clause" => n.child_by_field_name("parameter"),
             "function_declaration" | "generator_function_declaration" | "class_declaration"
             | "abstract_class_declaration" | "enum_declaration" => n.child_by_field_name("name"),
@@ -735,11 +780,12 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
                     "member_expression" => {
                         if let Some(prop) = f.child_by_field_name("property").filter(|p| p.kind() == "property_identifier") {
                             let obj = f.child_by_field_name("object");
+                            // `this` -> class; a global object -> `global:`; any other plain identifier ->
+                            // `ident:` for the namespace-import post-pass (never reaches the store)
                             let recv = this_hint(obj, ctx).or_else(|| {
-                                obj.filter(|o| o.kind() == "identifier")
-                                    .map(|o| text(o, src))
-                                    .filter(|t| JS_GLOBALS.contains(t))
-                                    .map(|t| format!("global:{t}"))
+                                obj.filter(|o| o.kind() == "identifier").map(|o| text(o, src)).map(|t| {
+                                    if JS_GLOBALS.contains(&t) { format!("global:{t}") } else { format!("ident:{t}") }
+                                })
                             });
                             push_call(out, text(prop, src), "method", node, ctx.enclosing, recv);
                         }
