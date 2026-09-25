@@ -10,7 +10,7 @@
 //! (it alone feeds the S2 exact resolver); the 8 universal-tier walks live in `crate::langs`.
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
@@ -220,6 +220,10 @@ struct WalkState<'o> {
     module_bindings: &'o mut Vec<(String, String)>,
     /// (call index, dotted receiver) for `a.b.f()` — a pure identifier chain not rooted at self
     chain_receivers: &'o mut Vec<(usize, String)>,
+    /// enclosing def/class scopes at this point of the walk: (scope node id, is a class body)
+    scope_stack: Vec<(usize, bool)>,
+    /// receiver call index -> its scope chain (for the scope-aware module-hint check)
+    recv_scopes: &'o mut HashMap<usize, Vec<(usize, bool)>>,
 }
 
 pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
@@ -239,6 +243,7 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
     let mut attr_receivers: Vec<(usize, String, String)> = Vec::new();
     let mut module_bindings: Vec<(String, String)> = Vec::new();
     let mut chain_receivers: Vec<(usize, String)> = Vec::new();
+    let mut recv_scopes: HashMap<usize, Vec<(usize, bool)>> = HashMap::new();
     let mut state = WalkState {
         out: &mut out,
         bindings: &mut bindings,
@@ -247,6 +252,8 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
         attr_receivers: &mut attr_receivers,
         module_bindings: &mut module_bindings,
         chain_receivers: &mut chain_receivers,
+        scope_stack: Vec::new(),
+        recv_scopes: &mut recv_scopes,
     };
     walk(
         tree.root_node(),
@@ -267,10 +274,18 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
         }
     }
 
-    // a name the file also binds locally (param, assignment, loop/with/except target, def) is not
-    // reliably the module: scope-blind on purpose, any such binding drops the module hint file-wide
-    let rebound = py_rebound_names(tree.root_node(), source.as_bytes());
-    module_bindings.retain(|(local, _)| !rebound.contains(local));
+    // a name bound some other way (param, assignment, loop/with/except target, def) in a scope the
+    // call can see is not the module there: Python scoping — enclosing functions (closures) and the
+    // module see through, a class body only for calls directly in it (not its methods)
+    let (scope_locals, module_rebound) = py_scope_bindings(tree.root_node(), source.as_bytes());
+    let shadowed = |name: &str, idx: usize| -> bool {
+        module_rebound.contains(name)
+            || recv_scopes.get(&idx).is_some_and(|chain| {
+                chain.iter().enumerate().any(|(i, (id, is_class))| {
+                    (!is_class || i + 1 == chain.len()) && scope_locals.get(id).is_some_and(|l| l.contains(name))
+                })
+            })
+    };
 
     // post-pass: `x.foo()` where x was bound to exactly ONE distinct class name in the same fn
     // (ctor assignment, a type-annotated parameter, or a same-file return type — same binding pool)
@@ -287,13 +302,17 @@ pub fn parse_python(source: &str) -> anyhow::Result<ParsedFile> {
             out.calls[idx].receiver_class = Some(classes[0].to_string());
         } else if classes.is_empty() {
             // not a local instance: an import-bound module name? (`json.load()`, `h.helper()`)
-            out.calls[idx].receiver_class = module_path(&module_bindings, &var, "").map(|p| format!("mod:{p}"));
+            if !shadowed(&var, idx) {
+                out.calls[idx].receiver_class = module_path(&module_bindings, &var, "").map(|p| format!("mod:{p}"));
+            }
         } // >1 distinct bindings -> no hint (never guess)
     }
     // `a.b.f()`: the chain's root is an import-bound module name -> its dotted path + the rest
     for (idx, chain) in chain_receivers {
         let (root, rest) = chain.split_once('.').unwrap_or((chain.as_str(), ""));
-        out.calls[idx].receiver_class = module_path(&module_bindings, root, rest).map(|p| format!("mod:{p}"));
+        if !shadowed(root, idx) {
+            out.calls[idx].receiver_class = module_path(&module_bindings, root, rest).map(|p| format!("mod:{p}"));
+        }
     }
 
     // T2 post-pass: `self.attr.foo()` where `attr` was bound to exactly ONE distinct class name
@@ -324,59 +343,98 @@ fn module_path(bindings: &[(String, String)], local: &str, rest: &str) -> Option
     Some(if rest.is_empty() { first.to_string() } else { format!("{first}.{rest}") })
 }
 
-/// Every name this file binds OTHER than by import: parameters (incl. lambda), assignment /
-/// augmented-assignment / for / comprehension targets, walrus names, with/except `as` targets,
-/// def and class names. Attribute and subscript targets (`m.x = 1`) don't rebind `m`.
-fn py_rebound_names(root: Node, src: &[u8]) -> std::collections::HashSet<String> {
-    fn targets(n: Node, src: &[u8], out: &mut std::collections::HashSet<String>) {
-        match n.kind() {
-            "identifier" => {
-                out.insert(text(n, src).to_string());
-            }
-            "attribute" | "subscript" => {}
-            _ => {
-                let mut c = n.walk();
-                for k in n.named_children(&mut c) {
-                    targets(k, src, out);
-                }
-            }
-        }
+/// Names bound OTHER than by import, per scope: def/class scopes keyed by node id, plus the
+/// module-level set. Params bind in their def's scope; assignment / augmented / for /
+/// comprehension targets, walrus names, with/except `as` targets and nested def/class names bind in
+/// the current scope (comprehensions and lambdas count as their enclosing scope: conservative);
+/// `global x` anywhere rebinds x module-wide. Attribute/subscript targets (`m.x = 1`) don't rebind.
+#[allow(clippy::type_complexity)]
+fn py_scope_bindings(root: Node, src: &[u8]) -> (HashMap<usize, HashSet<String>>, HashSet<String>) {
+    struct B<'s> {
+        src: &'s [u8],
+        locals: HashMap<usize, HashSet<String>>,
+        module: HashSet<String>,
     }
-    let mut out = std::collections::HashSet::new();
-    let mut stack = vec![root];
-    while let Some(n) = stack.pop() {
-        match n.kind() {
-            "parameters" | "lambda_parameters" => {
-                let mut c = n.walk();
-                for p in n.named_children(&mut c) {
-                    // only the parameter's own name, never its annotation or default value
-                    let name = match p.kind() {
-                        "default_parameter" | "typed_default_parameter" => p.child_by_field_name("name"),
-                        "typed_parameter" => p.named_child(0),
-                        _ => Some(p),
-                    };
-                    if let Some(nm) = name {
-                        targets(nm, src, &mut out);
+    impl B<'_> {
+        fn bind(&mut self, scope: Option<usize>, name: &str) {
+            match scope {
+                Some(id) => self.locals.entry(id).or_default().insert(name.to_string()),
+                None => self.module.insert(name.to_string()),
+            };
+        }
+        fn targets(&mut self, n: Node, scope: Option<usize>) {
+            match n.kind() {
+                "identifier" => self.bind(scope, text(n, self.src)),
+                "attribute" | "subscript" => {}
+                _ => {
+                    let mut c = n.walk();
+                    for k in n.named_children(&mut c).collect::<Vec<_>>() {
+                        self.targets(k, scope);
                     }
                 }
             }
-            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
-                if let Some(l) = n.child_by_field_name("left") {
-                    targets(l, src, &mut out);
-                }
-            }
-            "named_expression" | "function_definition" | "class_definition" => {
-                if let Some(nm) = n.child_by_field_name("name") {
-                    out.insert(text(nm, src).to_string());
-                }
-            }
-            "as_pattern_target" => targets(n, src, &mut out),
-            _ => {}
         }
-        let mut c = n.walk();
-        stack.extend(n.named_children(&mut c));
+        fn params(&mut self, ps: Node, scope: Option<usize>) {
+            let mut c = ps.walk();
+            for p in ps.named_children(&mut c).collect::<Vec<_>>() {
+                // only the parameter's own name, never its annotation or default value
+                let name = match p.kind() {
+                    "default_parameter" | "typed_default_parameter" => p.child_by_field_name("name"),
+                    "typed_parameter" => p.named_child(0),
+                    _ => Some(p),
+                };
+                if let Some(nm) = name {
+                    self.targets(nm, scope);
+                }
+            }
+        }
+        fn visit(&mut self, n: Node, scope: Option<usize>) {
+            let mut inner = scope;
+            match n.kind() {
+                "function_definition" | "class_definition" => {
+                    if let Some(nm) = n.child_by_field_name("name") {
+                        self.bind(scope, text(nm, self.src));
+                    }
+                    inner = Some(n.id());
+                    if let Some(ps) = n.child_by_field_name("parameters") {
+                        self.params(ps, inner);
+                    }
+                    // decorators / superclasses / annotations are evaluated in the outer scope,
+                    // but none of them bind names -> just walk the body in the new scope
+                    if let Some(body) = n.child_by_field_name("body") {
+                        self.visit(body, inner);
+                    }
+                    return;
+                }
+                "lambda_parameters" => self.params(n, scope),
+                "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                    if let Some(l) = n.child_by_field_name("left") {
+                        self.targets(l, scope);
+                    }
+                }
+                "named_expression" => {
+                    if let Some(nm) = n.child_by_field_name("name") {
+                        self.bind(scope, text(nm, self.src));
+                    }
+                }
+                "as_pattern_target" => self.targets(n, scope),
+                "global_statement" => {
+                    let mut c = n.walk();
+                    for id in n.named_children(&mut c).collect::<Vec<_>>() {
+                        self.bind(None, text(id, self.src));
+                    }
+                }
+                _ => {}
+            }
+            let mut c = n.walk();
+            for k in n.named_children(&mut c).collect::<Vec<_>>() {
+                self.visit(k, inner);
+            }
+        }
     }
-    out
+    let mut b = B { src, locals: HashMap::new(), module: HashSet::new() };
+    b.visit(root, None);
+    (b.locals, b.module)
 }
 
 fn is_py_ident_chain(t: &str) -> bool {
@@ -529,6 +587,14 @@ fn orm_model_fields(body: Node, src: &[u8]) -> (Option<String>, Vec<(String, Str
 
 fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
     let mut child_ctx = ctx;
+    let scope = match node.kind() {
+        "function_definition" => Some((node.id(), false)),
+        "class_definition" => Some((node.id(), true)),
+        _ => None,
+    };
+    if let Some(sc) = scope {
+        state.scope_stack.push(sc);
+    }
     match node.kind() {
         "function_definition" => {
             if let Some(name) = node.child_by_field_name("name") {
@@ -728,6 +794,9 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
                                 enclosing: ctx.enclosing_fn.to_string(),
                                 receiver_class,
                             });
+                            if var.is_some() || chain.is_some() {
+                                state.recv_scopes.insert(state.out.calls.len() - 1, state.scope_stack.clone());
+                            }
                             if let Some(v) = var {
                                 state.var_receivers.push((state.out.calls.len() - 1, v));
                             }
@@ -819,6 +888,9 @@ fn walk<'a>(node: Node, src: &'a [u8], state: &mut WalkState, ctx: Ctx<'a>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         walk(child, src, state, child_ctx);
+    }
+    if scope.is_some() {
+        state.scope_stack.pop();
     }
 }
 

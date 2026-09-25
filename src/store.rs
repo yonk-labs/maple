@@ -4159,9 +4159,21 @@ mod tests {
              def p2(xs):\n    for helpers in xs:\n        helpers.helper()\n",
         )
         .unwrap();
+        fs::write(
+            root.join("scoped.py"),
+            "from util import helpers\n\ndef p3():\n    helpers.helper()\n\ndef p4(helpers):\n    helpers.helper()\n\n\
+             def p5():\n    def inner():\n        helpers.helper()\n    helpers = object()\n\n\
+             class K:\n    helpers = 1\n    def m(self):\n        helpers.helper()\n",
+        )
+        .unwrap();
         let mut s = Store::open(root).unwrap();
         s.index_repo(root).unwrap();
         assert_eq!(edge_kinds(&s, "load", "r1").0, "unresolved", "json is external");
+        // scope-aware: a rebinding only shadows its own function (and functions nested in it)
+        assert_eq!(resolved(&s, "helper", "p3"), ("exact".into(), Some("util/helpers.py".into())), "not rebound here");
+        assert_eq!(edge_kinds(&s, "helper", "p4").0, "ambiguous", "param in this function");
+        assert_eq!(edge_kinds(&s, "helper", "inner").0, "ambiguous", "closure over p5's local");
+        assert_eq!(resolved(&s, "helper", "m"), ("exact".into(), Some("util/helpers.py".into())), "class attr not visible in methods");
         assert_eq!(edge_kinds(&s, "helper", "p1").0, "ambiguous", "param rebinds the imported name");
         assert_eq!(edge_kinds(&s, "helper", "p2").0, "ambiguous", "for-target rebinds it");
         for encl in ["r2", "r3", "r4"] {
