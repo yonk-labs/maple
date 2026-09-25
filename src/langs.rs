@@ -838,6 +838,10 @@ fn parse_js_family(src: &str, language: Language, what: &str) -> anyhow::Result<
     let typescript = what != "javascript";
     out.var_bindings.retain_mut(|(_, _, t)| match t.strip_prefix('=') {
         Some("?") if typescript => false,
+        Some("!") => {
+            *t = "?".to_string(); // destructuring write: void in TS too
+            true
+        }
         Some(rest) => {
             *t = rest.to_string();
             true
@@ -962,8 +966,8 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
         // `x = ...` later in the function: dispatch is on the runtime object, so a reassignment is a
         // binding too — `new T()` binds T, anything else "?" (disagrees with every type -> no hint).
         // Marked "=" so parse_js_family can drop the "?" ones for TS (see there).
-        "assignment_expression" => {
-            if let Some(l) = node.child_by_field_name("left").filter(|l| l.kind() == "identifier") {
+        "assignment_expression" => match node.child_by_field_name("left") {
+            Some(l) if l.kind() == "identifier" => {
                 let ty = node
                     .child_by_field_name("right")
                     .filter(|r| r.kind() == "new_expression")
@@ -972,7 +976,20 @@ fn walk_js<'a>(node: Node, src: &'a [u8], out: &mut ParsedFile, ctx: CppCtx<'a>)
                     .unwrap_or("?");
                 out.var_bindings.push((ctx.enclosing.to_string(), text(l, src).to_string(), format!("={ty}")));
             }
-        }
+            // `({ x } = ..)` / `[x] = ..`: every name it writes voids its hint, JS and TS alike
+            // ("=!"; destructuring reassignment of a typed local is rare, so strict is cheap)
+            Some(l) if matches!(l.kind(), "object_pattern" | "array_pattern") => {
+                let mut stack = vec![l];
+                while let Some(x) = stack.pop() {
+                    if matches!(x.kind(), "identifier" | "shorthand_property_identifier_pattern") {
+                        out.var_bindings.push((ctx.enclosing.to_string(), text(x, src).to_string(), "=!".into()));
+                    }
+                    let mut c = x.walk();
+                    stack.extend(x.named_children(&mut c));
+                }
+            }
+            _ => {}
+        },
         // `(x: T)` params (TS)
         "required_parameter" | "optional_parameter" => {
             if let (Some(p), Some(t)) = (

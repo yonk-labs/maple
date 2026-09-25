@@ -4331,7 +4331,9 @@ mod tests {
              function t1() { const p = new P(); p.go(); }\nfunction t2(q: Q) { q.go(); }\n\
              function t3() { let p: P = make(); p.go(); }\n\
              function t4() { let p = new P(); p = new Q(); p.go(); }\nfunction t5() { let p = new P(); p = make(); p.go(); }\n\
-             function t6() { let p = new P(); p = new P(); p.go(); }\n",
+             function t6() { let p = new P(); p = new P(); p.go(); }\n\
+             function t7() { let p = new P(); ({ p } = { p: new Q() }); p.go(); }\n\
+             function t8() { let p = new P(); [p] = [new Q()]; p.go(); }\n",
         )
         .unwrap();
         fs::write(
@@ -4382,6 +4384,8 @@ mod tests {
         // a reassignment to a different `new T()` voids the hint (runtime dispatch) ...
         assert_eq!(target("go", "t4").0, "ambiguous", "p reassigned to new Q()");
         assert_eq!(target("go", "t6"), ("exact".into(), Some("P".into())), "reassigned to the same type");
+        assert_eq!(target("go", "t7").0, "ambiguous", "object-destructuring reassignment");
+        assert_eq!(target("go", "t8").0, "ambiguous", "array-destructuring reassignment");
         // ... but in TS an unknown-value reassignment can't change the checked static type
         assert_eq!(target("go", "t5"), ("exact".into(), Some("P".into())), "ts: p = make() keeps P");
         // plain JS has no static type: any reassignment voids it
